@@ -25,7 +25,7 @@ import cv2
 # The camera link. This is your camera. You can also pass a different one on
 # the command line (see the instructions at the top of this file).
 # ---------------------------------------------------------------------------
-DEFAULT_SOURCE = "rtsp://adminmed:A1b2c3d4@192.168.1.5:554/stream1"
+DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=3&subtype=0"
 
 # How long to wait, in seconds, between attempts to (re)connect.
 RECONNECT_DELAY = 3
@@ -59,7 +59,7 @@ def explain_connection_failure(source):
     print("  1. Wrong link, username, or password  -> double-check every part of the link.")
     print("  2. This computer is not on the same network as the camera.")
     print("  3. The camera is switched off, rebooting, or unplugged.")
-    print("  4. The camera's IP address (192.168.1.5) has changed.")
+    print("  4. The camera's IP address (10.236.7.105) has changed.")
     print("  5. A firewall is blocking the connection (RTSP uses port 554).")
     print("--------------------------------------------------------------\n")
 
