@@ -1,0 +1,9 @@
+# Python virtual environment (the local "toolbox" — recreate with requirements.txt)
+venv/
+
+# Downloaded AI model weights (fetched with get_model.py, too large to store in git)
+*.pt
+
+# Python cache files
+__pycache__/
+*.pyc
