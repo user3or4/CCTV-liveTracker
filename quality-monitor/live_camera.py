@@ -25,7 +25,7 @@ import cv2
 # The camera link. This is your camera. You can also pass a different one on
 # the command line (see the instructions at the top of this file).
 # ---------------------------------------------------------------------------
-DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=3&subtype=0"
+DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=5&subtype=0"
 
 # How long to wait, in seconds, between attempts to (re)connect.
 RECONNECT_DELAY = 3

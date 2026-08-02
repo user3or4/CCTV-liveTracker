@@ -28,15 +28,19 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+import zone_config as zc
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
-DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=3&subtype=0"
+DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=5&subtype=0"
 MODEL_NAME = "yolov8n.pt"
 
 # The things we care about on an assembly line, by their YOLO class number:
 #   0 = person, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
 CLASSES_OF_INTEREST = [0, 2, 3, 5, 7]
+VEHICLE_CLASSES = [2, 3, 5, 7]   # what counts as a "car/vehicle" in the station
+PERSON_CLASS = [0]               # what counts as a "person" in the work area
 
 # Ignore weak guesses below this confidence (0.0-1.0).
 CONFIDENCE_THRESHOLD = 0.35
@@ -106,6 +110,18 @@ def main():
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
 
+    # --- Load the saved zones (drawn earlier with define_zones.py) ---
+    zones = zc.load_zones()
+    if zones is None:
+        print("\nNOTE: No zones are saved yet (zones.json not found).")
+        print("The live view will still run, but no station/work areas will be shown.")
+        print("To draw them, run:  .\\venv\\Scripts\\python define_zones.py\n")
+    # The actual zone objects are built once we know the video size (below).
+    station_zone = None
+    work_zone = None
+    station_annotator = None
+    work_annotator = None
+
     print(f"\nConnecting to camera: {source}")
     print("A video window will open. Click it and press  Q  to quit.\n")
 
@@ -140,6 +156,26 @@ def main():
                 continue
             last_good_frame = time.time()
 
+            # --- Build the zones once, now that we know the video size ---
+            if zones is not None and station_zone is None:
+                frame_h, frame_w = frame.shape[:2]
+                saved_wh = zones["image_size"]
+                station_pts = zc.scale_polygon(zones[zc.STATION], saved_wh, (frame_w, frame_h))
+                work_pts = zc.scale_polygon(zones[zc.WORK_AREA], saved_wh, (frame_w, frame_h))
+
+                station_zone = sv.PolygonZone(polygon=station_pts)
+                work_zone = sv.PolygonZone(polygon=work_pts)
+                station_annotator = sv.PolygonZoneAnnotator(
+                    zone=station_zone,
+                    color=sv.Color(*zc.STATION_COLOR_BGR[::-1]),  # BGR -> RGB for supervision
+                    thickness=2,
+                )
+                work_annotator = sv.PolygonZoneAnnotator(
+                    zone=work_zone,
+                    color=sv.Color(*zc.WORK_AREA_COLOR_BGR[::-1]),
+                    thickness=2,
+                )
+
             # --- Detect objects in this frame ---
             # verbose=False keeps YOLO from printing a line for every frame.
             results = model(frame, verbose=False)[0]
@@ -158,9 +194,38 @@ def main():
                 name = model.names[int(class_id)]
                 labels.append(f"{name} #{int(tracker_id)}")
 
+            # --- Check the zones: car in station? worker in work area? ---
+            cars_in_station = 0
+            people_in_work = 0
+            if station_zone is not None:
+                vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
+                people = detections[np.isin(detections.class_id, PERSON_CLASS)]
+                # trigger() returns True/False per object and updates the zone's count.
+                if len(vehicles) > 0:
+                    cars_in_station = int(station_zone.trigger(vehicles).sum())
+                else:
+                    station_zone.trigger(vehicles)  # keep the zone count at 0
+                if len(people) > 0:
+                    people_in_work = int(work_zone.trigger(people).sum())
+                else:
+                    work_zone.trigger(people)
+
             # --- Draw boxes and labels onto the frame ---
             annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
             annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+
+            # --- Draw the two zones on top ---
+            if station_zone is not None:
+                annotated = station_annotator.annotate(scene=annotated)
+                annotated = work_annotator.annotate(scene=annotated)
+
+                # Plain-English status line for each zone.
+                car_status = "YES" if cars_in_station > 0 else "no"
+                worker_status = "YES" if people_in_work > 0 else "no"
+                cv2.putText(annotated, f"Car in station: {car_status}", (15, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.STATION_COLOR_BGR, 2, cv2.LINE_AA)
+                cv2.putText(annotated, f"Worker in area: {worker_status}", (15, 105),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.WORK_AREA_COLOR_BGR, 2, cv2.LINE_AA)
 
             # --- FPS counter (updates about once per second) ---
             frame_count += 1
