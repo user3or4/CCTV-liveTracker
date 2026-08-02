@@ -50,6 +50,45 @@ FEED_TIMEOUT = 5         # seconds of no frames before we treat the feed as drop
 WINDOW_NAME = "Quality Monitor - Detection + Tracking  (press Q to quit)"
 
 
+def count_inside(detections, polygon):
+    """
+    Count how many of the given objects are INSIDE the polygon.
+
+    We test the point where each object touches the ground (the bottom-centre
+    of its box) - so a car counts when its wheels are in the zone and a worker
+    when their feet are. Uses OpenCV's point-in-polygon test, which works the
+    same across all library versions.
+    """
+    if len(detections) == 0:
+        return 0
+    contour = polygon.reshape((-1, 1, 2)).astype(np.int32)
+    count = 0
+    for x1, y1, x2, y2 in detections.xyxy:
+        foot = (float((x1 + x2) / 2.0), float(y2))
+        if cv2.pointPolygonTest(contour, foot, False) >= 0:
+            count += 1
+    return count
+
+
+def draw_zone(image, polygon, color_bgr, label, count):
+    """Shade and outline a zone, and write its name + live count on it."""
+    pts = polygon.reshape((-1, 1, 2)).astype(np.int32)
+
+    # Light see-through shading so the video is still visible underneath.
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [pts], color_bgr)
+    cv2.addWeighted(overlay, 0.20, image, 0.80, 0, dst=image)
+
+    # Solid outline.
+    cv2.polylines(image, [pts], isClosed=True, color=color_bgr, thickness=2)
+
+    # Label near the first corner.
+    corner = tuple(polygon[0])
+    cv2.putText(image, f"{label}: {count}", (corner[0], max(corner[1] - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2, cv2.LINE_AA)
+    return image
+
+
 def open_camera(source):
     """Try to open the camera. Returns an opened capture, or None on failure."""
     capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
@@ -116,11 +155,9 @@ def main():
         print("\nNOTE: No zones are saved yet (zones.json not found).")
         print("The live view will still run, but no station/work areas will be shown.")
         print("To draw them, run:  .\\venv\\Scripts\\python define_zones.py\n")
-    # The actual zone objects are built once we know the video size (below).
-    station_zone = None
-    work_zone = None
-    station_annotator = None
-    work_annotator = None
+    # The zone corner-points are prepared once we know the video size (below).
+    station_pts = None
+    work_pts = None
 
     print(f"\nConnecting to camera: {source}")
     print("A video window will open. Click it and press  Q  to quit.\n")
@@ -156,25 +193,12 @@ def main():
                 continue
             last_good_frame = time.time()
 
-            # --- Build the zones once, now that we know the video size ---
-            if zones is not None and station_zone is None:
+            # --- Prepare the zone points once, now that we know the video size ---
+            if zones is not None and station_pts is None:
                 frame_h, frame_w = frame.shape[:2]
                 saved_wh = zones["image_size"]
                 station_pts = zc.scale_polygon(zones[zc.STATION], saved_wh, (frame_w, frame_h))
                 work_pts = zc.scale_polygon(zones[zc.WORK_AREA], saved_wh, (frame_w, frame_h))
-
-                station_zone = sv.PolygonZone(polygon=station_pts)
-                work_zone = sv.PolygonZone(polygon=work_pts)
-                station_annotator = sv.PolygonZoneAnnotator(
-                    zone=station_zone,
-                    color=sv.Color(*zc.STATION_COLOR_BGR[::-1]),  # BGR -> RGB for supervision
-                    thickness=2,
-                )
-                work_annotator = sv.PolygonZoneAnnotator(
-                    zone=work_zone,
-                    color=sv.Color(*zc.WORK_AREA_COLOR_BGR[::-1]),
-                    thickness=2,
-                )
 
             # --- Detect objects in this frame ---
             # verbose=False keeps YOLO from printing a line for every frame.
@@ -197,27 +221,20 @@ def main():
             # --- Check the zones: car in station? worker in work area? ---
             cars_in_station = 0
             people_in_work = 0
-            if station_zone is not None:
+            if station_pts is not None:
                 vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
                 people = detections[np.isin(detections.class_id, PERSON_CLASS)]
-                # trigger() returns True/False per object and updates the zone's count.
-                if len(vehicles) > 0:
-                    cars_in_station = int(station_zone.trigger(vehicles).sum())
-                else:
-                    station_zone.trigger(vehicles)  # keep the zone count at 0
-                if len(people) > 0:
-                    people_in_work = int(work_zone.trigger(people).sum())
-                else:
-                    work_zone.trigger(people)
+                cars_in_station = count_inside(vehicles, station_pts)
+                people_in_work = count_inside(people, work_pts)
 
             # --- Draw boxes and labels onto the frame ---
             annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
             annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
             # --- Draw the two zones on top ---
-            if station_zone is not None:
-                annotated = station_annotator.annotate(scene=annotated)
-                annotated = work_annotator.annotate(scene=annotated)
+            if station_pts is not None:
+                draw_zone(annotated, station_pts, zc.STATION_COLOR_BGR, "STATION", cars_in_station)
+                draw_zone(annotated, work_pts, zc.WORK_AREA_COLOR_BGR, "WORK AREA", people_in_work)
 
                 # Plain-English status line for each zone.
                 car_status = "YES" if cars_in_station > 0 else "no"
