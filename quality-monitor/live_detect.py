@@ -23,12 +23,19 @@ import sys
 import time
 import warnings
 
+import csv
+from datetime import datetime
+from pathlib import Path
+
 import cv2
 import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
 import zone_config as zc
+from timers import StationMonitor
+
+CYCLES_CSV = Path(__file__).parent / "cycles.csv"
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -68,6 +75,41 @@ def count_inside(detections, polygon):
         if cv2.pointPolygonTest(contour, foot, False) >= 0:
             count += 1
     return count
+
+
+def ids_inside(detections, polygon):
+    """Return the set of tracking IDs whose ground point is inside the polygon."""
+    if len(detections) == 0:
+        return set()
+    contour = polygon.reshape((-1, 1, 2)).astype(np.int32)
+    tracker_ids = detections.tracker_id
+    found = set()
+    for i, (x1, y1, x2, y2) in enumerate(detections.xyxy):
+        foot = (float((x1 + x2) / 2.0), float(y2))
+        if cv2.pointPolygonTest(contour, foot, False) >= 0:
+            tid = tracker_ids[i] if tracker_ids is not None else i
+            found.add(int(tid))
+    return found
+
+
+def log_report(report):
+    """Print a car's final numbers and append them to cycles.csv for the record."""
+    print("\n==================  CAR FINISHED  ==================")
+    print(f"  Cycle time (car in station) : {report['cycle_time']:.1f} s")
+    print(f"  Hands-on time (worker there): {report['hands_on_time']:.1f} s")
+    print(f"  Unique workers              : {report['unique_workers']}")
+    print(f"  Separate on-sessions        : {report['on_sessions']}")
+    print("===================================================\n")
+
+    new_file = not CYCLES_CSV.exists()
+    with open(CYCLES_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        if new_file:
+            writer.writerow(["finished_at", "cycle_time_s", "hands_on_time_s",
+                             "unique_workers", "on_sessions"])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         report["cycle_time"], report["hands_on_time"],
+                         report["unique_workers"], report["on_sessions"]])
 
 
 def draw_zone(image, polygon, color_bgr, label, count):
@@ -159,6 +201,11 @@ def main():
     station_pts = None
     work_pts = None
 
+    # The timing engine: watches for a car and times the worker's hands-on work.
+    monitor = StationMonitor()
+    last_report = None
+    last_report_time = 0.0
+
     print(f"\nConnecting to camera: {source}")
     print("A video window will open. Click it and press  Q  to quit.\n")
 
@@ -225,7 +272,15 @@ def main():
                 vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
                 people = detections[np.isin(detections.class_id, PERSON_CLASS)]
                 cars_in_station = count_inside(vehicles, station_pts)
-                people_in_work = count_inside(people, work_pts)
+                worker_ids = ids_inside(people, work_pts)
+                people_in_work = len(worker_ids)
+
+                # Drive the timing engine. It returns a report when a car leaves.
+                report = monitor.update(time.time(), cars_in_station > 0, worker_ids)
+                if report is not None:
+                    log_report(report)
+                    last_report = report
+                    last_report_time = time.time()
 
             # --- Draw boxes and labels onto the frame ---
             annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
@@ -243,6 +298,30 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.STATION_COLOR_BGR, 2, cv2.LINE_AA)
                 cv2.putText(annotated, f"Worker in area: {worker_status}", (15, 105),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.WORK_AREA_COLOR_BGR, 2, cv2.LINE_AA)
+
+                # Live timers while a car is being worked on.
+                readout = monitor.live_readout()
+                if readout is not None:
+                    working = "WORKING" if readout["worker_on"] else "paused"
+                    cv2.putText(annotated,
+                                f"CYCLE: {readout['cycle_time']:.0f}s   HANDS-ON: {readout['hands_on_time']:.0f}s  [{working}]",
+                                (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(annotated,
+                                f"on-sessions: {readout['on_sessions']}   workers: {readout['workers_seen']}",
+                                (15, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+                # Show the last finished car's numbers for 10 seconds.
+                if last_report is not None and time.time() - last_report_time < 10:
+                    y0 = annotated.shape[0] - 110
+                    box = annotated.copy()
+                    cv2.rectangle(box, (10, y0 - 10), (430, y0 + 95), (0, 0, 0), -1)
+                    annotated = cv2.addWeighted(box, 0.55, annotated, 0.45, 0)
+                    cv2.putText(annotated, "LAST CAR:", (20, y0 + 12),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(annotated, f"cycle {last_report['cycle_time']:.0f}s   hands-on {last_report['hands_on_time']:.0f}s",
+                                (20, y0 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(annotated, f"workers {last_report['unique_workers']}   sessions {last_report['on_sessions']}",
+                                (20, y0 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
             # --- FPS counter (updates about once per second) ---
             frame_count += 1

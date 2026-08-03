@@ -7,3 +7,7 @@ venv/
 # Python cache files
 __pycache__/
 *.pyc
+
+# Machine-specific runtime data (drawn on your camera / measured on your line)
+zones.json
+cycles.csv
