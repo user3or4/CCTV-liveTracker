@@ -1,4 +1,4 @@
-"""
+r"""
 Draw one or more numbered inspection areas by clicking on a camera snapshot.
 
 For each area (station 1, 2, 3, ...) you draw TWO shapes, one after the other:

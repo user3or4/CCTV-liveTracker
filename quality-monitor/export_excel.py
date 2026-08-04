@@ -1,30 +1,38 @@
-"""
+r"""
 Export the logbook database to an Excel file.
 
 Run this any time you want a spreadsheet of everything recorded so far:
 
     .\venv\Scripts\python export_excel.py
 
-It creates  logbook_export.xlsx  in this folder with two sheets:
+By default it writes a NEW file stamped with the date and time, e.g.
+    logbook_export_2026-08-04_1530.xlsx
+so it never clashes with a file you already have open in Excel.
+
+You can also give it your own name:
+    .\venv\Scripts\python export_excel.py "August report.xlsx"
+
+The file has two sheets:
     "Cars"          - one row per finished car (headline numbers).
     "Worker times"  - one row per worker per car (personal hands-on times).
-
-You can also give it a name:
-    .\venv\Scripts\python export_excel.py "August report.xlsx"
 """
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
 import database as db
 
-DEFAULT_OUT = Path(__file__).parent / "logbook_export.xlsx"
+
+def default_name():
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    return Path(__file__).parent / f"logbook_export_{stamp}.xlsx"
 
 
 def main():
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_OUT
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else default_name()
 
     if not db.DB_FILE.exists():
         print("No logbook yet - the database file 'logbook.db' does not exist.")
@@ -47,6 +55,12 @@ def main():
     except ModuleNotFoundError:
         print("The Excel engine 'openpyxl' isn't installed. Install it once with:")
         print("    .\\venv\\Scripts\\pip install openpyxl")
+        raise SystemExit(1)
+    except PermissionError:
+        print("Could not write the Excel file - it looks like it's already OPEN.")
+        print(f"  File: {out}")
+        print("Close it in Excel and run this again (or it will use a new timestamped")
+        print("name automatically next time).")
         raise SystemExit(1)
 
     print(f"Exported {len(cars)} car(s) and {len(workers)} worker row(s) to:")
