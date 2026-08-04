@@ -92,9 +92,9 @@ def ids_inside(detections, polygon):
     return found
 
 
-def log_report(report):
+def log_report(report, area_id):
     """Print a car's final numbers and append them to cycles.csv for the record."""
-    print("\n==================  CAR FINISHED  ==================")
+    print(f"\n=============  STATION {area_id}: CAR FINISHED  =============")
     print(f"  Cycle time (car in station) : {report['cycle_time']:.1f} s")
     print(f"  Hands-on time (worker there): {report['hands_on_time']:.1f} s")
     print(f"  Unique workers              : {report['unique_workers']}")
@@ -105,9 +105,9 @@ def log_report(report):
     with open(CYCLES_CSV, "a", newline="") as f:
         writer = csv.writer(f)
         if new_file:
-            writer.writerow(["finished_at", "cycle_time_s", "hands_on_time_s",
+            writer.writerow(["finished_at", "station", "cycle_time_s", "hands_on_time_s",
                              "unique_workers", "on_sessions"])
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), area_id,
                          report["cycle_time"], report["hands_on_time"],
                          report["unique_workers"], report["on_sessions"]])
 
@@ -191,19 +191,21 @@ def main():
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
 
-    # --- Load the saved zones (drawn earlier with define_zones.py) ---
-    zones = zc.load_zones()
+    # --- Load the saved areas (drawn earlier with define_zones.py) ---
+    zones = zc.load_areas()
     if zones is None:
-        print("\nNOTE: No zones are saved yet (zones.json not found).")
-        print("The live view will still run, but no station/work areas will be shown.")
+        print("\nNOTE: No areas are saved yet (zones.json not found).")
+        print("The live view will still run, but no stations/work areas will be shown.")
         print("To draw them, run:  .\\venv\\Scripts\\python define_zones.py\n")
-    # The zone corner-points are prepared once we know the video size (below).
-    station_pts = None
-    work_pts = None
+    else:
+        print(f"Loaded {len(zones['areas'])} area(s): "
+              f"{', '.join('station ' + str(a['id']) for a in zones['areas'])}")
 
-    # The timing engine: watches for a car and times the worker's hands-on work.
-    monitor = StationMonitor()
-    last_report = None
+    # Per-area data is prepared once we know the video size (below).
+    # Each entry: {"id", "station_pts", "work_pts", "monitor"}
+    areas = []
+    display_area_id = None      # which area's timer we show on screen (the first)
+    last_report = None          # last finished car (for the on-screen banner)
     last_report_time = 0.0
 
     print(f"\nConnecting to camera: {source}")
@@ -240,12 +242,19 @@ def main():
                 continue
             last_good_frame = time.time()
 
-            # --- Prepare the zone points once, now that we know the video size ---
-            if zones is not None and station_pts is None:
+            # --- Prepare all areas once, now that we know the video size ---
+            if zones is not None and not areas:
                 frame_h, frame_w = frame.shape[:2]
                 saved_wh = zones["image_size"]
-                station_pts = zc.scale_polygon(zones[zc.STATION], saved_wh, (frame_w, frame_h))
-                work_pts = zc.scale_polygon(zones[zc.WORK_AREA], saved_wh, (frame_w, frame_h))
+                for a in zones["areas"]:
+                    areas.append({
+                        "id": a["id"],
+                        "station_pts": zc.scale_polygon(a[zc.STATION], saved_wh, (frame_w, frame_h)),
+                        "work_pts": zc.scale_polygon(a[zc.WORK_AREA], saved_wh, (frame_w, frame_h)),
+                        "monitor": StationMonitor(),
+                    })
+                if areas:
+                    display_area_id = areas[0]["id"]   # show the first area's timer
 
             # --- Detect objects in this frame ---
             # verbose=False keeps YOLO from printing a line for every frame.
@@ -265,58 +274,59 @@ def main():
                 name = model.names[int(class_id)]
                 labels.append(f"{name} #{int(tracker_id)}")
 
-            # --- Check the zones: car in station? worker in work area? ---
-            cars_in_station = 0
-            people_in_work = 0
-            if station_pts is not None:
-                vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
-                people = detections[np.isin(detections.class_id, PERSON_CLASS)]
-                cars_in_station = count_inside(vehicles, station_pts)
-                worker_ids = ids_inside(people, work_pts)
-                people_in_work = len(worker_ids)
+            # --- Split detections once into vehicles and people ---
+            vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
+            people = detections[np.isin(detections.class_id, PERSON_CLASS)]
+            now = time.time()
 
-                # Drive the timing engine. It returns a report when a car leaves.
-                report = monitor.update(time.time(), cars_in_station > 0, worker_ids)
+            # --- For each area: check zones and drive its own timer ---
+            for a in areas:
+                a["cars"] = count_inside(vehicles, a["station_pts"])
+                a["worker_ids"] = ids_inside(people, a["work_pts"])
+
+                report = a["monitor"].update(now, a["cars"] > 0, a["worker_ids"])
                 if report is not None:
-                    log_report(report)
-                    last_report = report
-                    last_report_time = time.time()
+                    log_report(report, a["id"])
+                    if a["id"] == display_area_id:
+                        last_report = report
+                        last_report_time = now
 
             # --- Draw boxes and labels onto the frame ---
             annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
             annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
-            # --- Draw the two zones on top ---
-            if station_pts is not None:
-                draw_zone(annotated, station_pts, zc.STATION_COLOR_BGR, "STATION", cars_in_station)
-                draw_zone(annotated, work_pts, zc.WORK_AREA_COLOR_BGR, "WORK AREA", people_in_work)
+            # --- Draw every area (both shapes), coloured and numbered ---
+            for a in areas:
+                color = zc.color_for(a["id"])
+                draw_zone(annotated, a["station_pts"], color, f"STATION {a['id']}", a["cars"])
+                draw_zone(annotated, a["work_pts"], color, f"WORK {a['id']}", len(a["worker_ids"]))
 
-                # Plain-English status line for each zone.
-                car_status = "YES" if cars_in_station > 0 else "no"
-                worker_status = "YES" if people_in_work > 0 else "no"
-                cv2.putText(annotated, f"Car in station: {car_status}", (15, 75),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.STATION_COLOR_BGR, 2, cv2.LINE_AA)
-                cv2.putText(annotated, f"Worker in area: {worker_status}", (15, 105),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.WORK_AREA_COLOR_BGR, 2, cv2.LINE_AA)
-
-                # Live timers while a car is being worked on.
-                readout = monitor.live_readout()
+            # --- Show the FIRST area's live timer in the top-left panel ---
+            if display_area_id is not None:
+                first = areas[0]
+                readout = first["monitor"].live_readout()
+                cv2.putText(annotated, f"STATION {first['id']}", (15, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.color_for(first["id"]), 2, cv2.LINE_AA)
+                car_status = "YES" if first["cars"] > 0 else "no"
+                worker_status = "YES" if len(first["worker_ids"]) > 0 else "no"
+                cv2.putText(annotated, f"Car in station: {car_status}   Worker: {worker_status}",
+                            (15, 103), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
                 if readout is not None:
                     working = "WORKING" if readout["worker_on"] else "paused"
                     cv2.putText(annotated,
                                 f"CYCLE: {readout['cycle_time']:.0f}s   HANDS-ON: {readout['hands_on_time']:.0f}s  [{working}]",
-                                (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+                                (15, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(annotated,
                                 f"on-sessions: {readout['on_sessions']}   workers: {readout['workers_seen']}",
-                                (15, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+                                (15, 166), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
 
-                # Show the last finished car's numbers for 10 seconds.
-                if last_report is not None and time.time() - last_report_time < 10:
+                # Show the first area's last finished car for 10 seconds.
+                if last_report is not None and now - last_report_time < 10:
                     y0 = annotated.shape[0] - 110
                     box = annotated.copy()
-                    cv2.rectangle(box, (10, y0 - 10), (430, y0 + 95), (0, 0, 0), -1)
+                    cv2.rectangle(box, (10, y0 - 10), (440, y0 + 95), (0, 0, 0), -1)
                     annotated = cv2.addWeighted(box, 0.55, annotated, 0.45, 0)
-                    cv2.putText(annotated, "LAST CAR:", (20, y0 + 12),
+                    cv2.putText(annotated, f"LAST CAR (station {display_area_id}):", (20, y0 + 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(annotated, f"cycle {last_report['cycle_time']:.0f}s   hands-on {last_report['hands_on_time']:.0f}s",
                                 (20, y0 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
