@@ -57,6 +57,16 @@ def init_db(db_path=DB_FILE):
             sessions      INTEGER NOT NULL,    -- this person's on/off count
             FOREIGN KEY (car_row_id) REFERENCES cars(id)
         );
+
+        -- Car-only phase: one row each time a car leaves a parking stage.
+        CREATE TABLE IF NOT EXISTS stage_visits (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            entered_at   TEXT,                 -- when the car arrived at the stage
+            left_at      TEXT    NOT NULL,     -- when the car left the stage
+            stage        TEXT    NOT NULL,     -- e.g. "Stage 1"
+            car_id       INTEGER,              -- the car's tracking number
+            dwell_s      REAL    NOT NULL      -- how long the car stayed (seconds)
+        );
         """
     )
     # Add newer columns to an older logbook that predates them (keeps old data).
@@ -110,5 +120,36 @@ def save_car(report, station_name, db_path=DB_FILE, finished_at=None):
 
         conn.commit()   # <-- saved to disk right now; nothing is lost on a crash
         return car_row_id
+    finally:
+        conn.close()
+
+
+def save_stage_visit(report, stage_name, db_path=DB_FILE, left_at=None):
+    """
+    Save one finished stage visit (a car that stayed in a parking stage) and
+    commit immediately so nothing is lost if the program stops.
+
+    report: the dict from timers.StationMonitor (cycle_time is the dwell time,
+            plus car_track_id and start/end epochs).
+    Returns the new row id.
+    """
+    fmt = "%Y-%m-%d %H:%M:%S"
+    end_epoch = report.get("end_epoch")
+    start_epoch = report.get("start_epoch")
+    left = left_at or (
+        datetime.fromtimestamp(end_epoch).strftime(fmt) if end_epoch
+        else datetime.now().strftime(fmt))
+    entered = datetime.fromtimestamp(start_epoch).strftime(fmt) if start_epoch else None
+
+    conn = connect(db_path)
+    try:
+        cur = conn.execute(
+            """INSERT INTO stage_visits (entered_at, left_at, stage, car_id, dwell_s)
+               VALUES (?, ?, ?, ?, ?)""",
+            (entered, left, stage_name, report.get("car_track_id"),
+             report["cycle_time"]),
+        )
+        conn.commit()
+        return cur.lastrowid
     finally:
         conn.close()

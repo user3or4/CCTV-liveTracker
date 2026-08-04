@@ -1,11 +1,8 @@
 r"""
-Draw one or more numbered inspection areas by clicking on a camera snapshot.
+Draw one or more numbered parking STAGES by clicking on a camera snapshot.
 
-For each area (station 1, 2, 3, ...) you draw TWO shapes, one after the other:
-    1) STATION   - where the CAR sits.
-    2) WORK AREA - the space next to it where the WORKER stands.
-
-After each area you're asked whether to add another. All areas are saved to
+Focus: CARS only. For each stage you draw ONE shape around the parking spot.
+After each one you're asked whether to add another. All stages are saved to
 zones.json so you only draw them once.
 
 HOW TO RUN (from inside the quality-monitor folder):
@@ -18,7 +15,7 @@ CONTROLS while drawing a shape (also shown on screen):
     R ................ clear the current shape and start it over
     Q or ESC ......... cancel everything (nothing saved)
 
-Tip: click at least 3 corners per shape, going around the area in order.
+Tip: click at least 3 corners per stage, going around the parking spot in order.
 """
 
 import sys
@@ -30,7 +27,7 @@ import numpy as np
 import zone_config as zc
 
 DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=5&subtype=0"
-WINDOW_NAME = "Define Areas - click the corners"
+WINDOW_NAME = "Define Stages - click the corners"
 
 
 def grab_snapshot(source, tries=30):
@@ -52,7 +49,7 @@ def grab_snapshot(source, tries=30):
 
 
 class PolygonDrawer:
-    """Lets the user click the corners of one shape on the snapshot."""
+    """Lets the user click the corners of one stage on the snapshot."""
 
     def __init__(self, base_image, title, color_bgr):
         self.base = base_image
@@ -72,11 +69,10 @@ class PolygonDrawer:
     def render(self, already):
         img = self.base.copy()
 
-        # Show areas already finished (faint), so you can place the next ones.
-        for a in already:
-            for key in (zc.STATION, zc.WORK_AREA):
-                pts = np.array(a[key], dtype=np.int32)
-                cv2.polylines(img, [pts], True, zc.color_for(a["id"]), 1)
+        # Show stages already finished (faint), so you can place the next ones.
+        for s in already:
+            pts = np.array(s[zc.STAGE], dtype=np.int32)
+            cv2.polylines(img, [pts], True, zc.color_for(s["id"]), 1)
 
         if len(self.points) >= 3:
             overlay = img.copy()
@@ -99,7 +95,6 @@ class PolygonDrawer:
         return img
 
     def run(self, already):
-        """Returns the list of points, or None if the user cancelled."""
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
         while True:
             cv2.imshow(WINDOW_NAME, self.render(already))
@@ -111,27 +106,26 @@ class PolygonDrawer:
             if key in (13, 10):  # ENTER
                 if len(self.points) >= 3:
                     return self.points
-                print("  Need at least 3 corners before finishing this shape.")
+                print("  Need at least 3 corners before finishing this stage.")
 
 
-def ask_add_another(base_image, areas):
-    """Between areas: A = add another, F = finish and save, Q = cancel."""
+def ask_add_another(base_image, stages):
+    """Between stages: A = add another, F = finish and save, Q = cancel."""
     while True:
         img = base_image.copy()
-        for a in areas:
-            for key in (zc.STATION, zc.WORK_AREA):
-                pts = np.array(a[key], dtype=np.int32)
-                cv2.polylines(img, [pts], True, zc.color_for(a["id"]), 2)
-            c = tuple(np.array(a[zc.STATION][0]))
-            cv2.putText(img, f"{a['id']}", (c[0], max(c[1] - 8, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, zc.color_for(a["id"]), 2, cv2.LINE_AA)
+        for s in stages:
+            pts = np.array(s[zc.STAGE], dtype=np.int32)
+            cv2.polylines(img, [pts], True, zc.color_for(s["id"]), 2)
+            c = tuple(np.array(s[zc.STAGE][0]))
+            cv2.putText(img, f"{s['id']}", (c[0], max(c[1] - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, zc.color_for(s["id"]), 2, cv2.LINE_AA)
 
         banner = img.copy()
         cv2.rectangle(banner, (0, 0), (img.shape[1], 70), (0, 0, 0), -1)
         img = cv2.addWeighted(banner, 0.6, img, 0.4, 0)
-        cv2.putText(img, f"Saved {len(areas)} area(s).",
+        cv2.putText(img, f"Saved {len(stages)} stage(s).",
                     (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, "Press  A = add another area    F = finish & save    Q = cancel",
+        cv2.putText(img, "Press  A = add another stage    F = finish & save    Q = cancel",
                     (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow(WINDOW_NAME, img)
@@ -161,27 +155,22 @@ def main():
     print(f"Got a {width}x{height} snapshot. Opening the drawing window...\n")
     cv2.namedWindow(WINDOW_NAME)
 
-    areas = []
-    area_id = 1
+    stages = []
+    stage_id = 1
     while True:
-        color = zc.color_for(area_id)
-        station = PolygonDrawer(frame, f"STATION {area_id} (car area)", color).run(areas)
-        if station is None:
-            cv2.destroyAllWindows()
-            print("Cancelled. Nothing saved.")
-            return
-        work = PolygonDrawer(frame, f"WORK AREA {area_id} (worker area)", color).run(areas)
-        if work is None:
+        color = zc.color_for(stage_id)
+        pts = PolygonDrawer(frame, f"STAGE {stage_id} (parking spot)", color).run(stages)
+        if pts is None:
             cv2.destroyAllWindows()
             print("Cancelled. Nothing saved.")
             return
 
-        areas.append({"id": area_id, zc.STATION: station, zc.WORK_AREA: work})
-        print(f"  Area {area_id} captured.")
+        stages.append({"id": stage_id, zc.STAGE: pts})
+        print(f"  Stage {stage_id} captured.")
 
-        choice = ask_add_another(frame, areas)
+        choice = ask_add_another(frame, stages)
         if choice == "add":
-            area_id += 1
+            stage_id += 1
             continue
         if choice == "cancel":
             cv2.destroyAllWindows()
@@ -190,11 +179,10 @@ def main():
         break  # finish
 
     cv2.destroyAllWindows()
-    path = zc.save_areas(areas, (width, height))
-    print(f"\nSaved {len(areas)} area(s) to:\n  {path}")
-    for a in areas:
-        print(f"  Area {a['id']}: station {len(a[zc.STATION])} corners, "
-              f"work area {len(a[zc.WORK_AREA])} corners")
+    path = zc.save_stages(stages, (width, height))
+    print(f"\nSaved {len(stages)} stage(s) to:\n  {path}")
+    for s in stages:
+        print(f"  Stage {s['id']}: {len(s[zc.STAGE])} corners")
     print("\nDone. Now run the live view:  .\\venv\\Scripts\\python live_detect.py")
 
 

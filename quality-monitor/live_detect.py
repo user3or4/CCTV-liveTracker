@@ -46,25 +46,22 @@ DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?ch
 #   yolov8l.pt = large  (strongest we'd normally use; slowest)
 MODEL_NAME = "yolov8m.pt"
 
-# "How much of the object must be inside the area to count as IN" (0.0-1.0).
+# "How much of the car must be inside the stage to count as parked" (0.0-1.0).
 # 0.6 = 60%. Overlap is measured by area, which suits an angled camera.
-CAR_OVERLAP_THRESHOLD = 0.60      # a car counts when 60%+ of it is in the station
-PERSON_OVERLAP_THRESHOLD = 0.40   # a worker counts when 40%+ is in the work area
+CAR_OVERLAP_THRESHOLD = 0.60
 
-# The things we care about on an assembly line, by their YOLO class number:
-#   0 = person, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
-CLASSES_OF_INTEREST = [0, 2, 3, 5, 7]
-VEHICLE_CLASSES = [2, 3, 5, 7]   # what counts as a "car/vehicle" in the station
-PERSON_CLASS = [0]               # what counts as a "person" in the work area
+# This phase is CARS ONLY. YOLO vehicle classes:
+#   2 = car, 3 = motorcycle, 5 = bus, 7 = truck
+VEHICLE_CLASSES = [2, 3, 5, 7]
 
 # Ignore weak guesses below this confidence (0.0-1.0).
 # Lowered so real cars are picked up more easily (fewer misses).
 CONFIDENCE_THRESHOLD = 0.25
 
-# To keep the computer's load light, we only RUN the AI this many times per
-# minute. The video window still updates smoothly; only the heavy detection is
-# throttled. 15/minute = look at the scene every 4 seconds.
-DETECTIONS_PER_MINUTE = 15
+# To keep the computer's load light (and let a stronger model run), we only RUN
+# the AI this many times per minute. The video window still updates smoothly;
+# only the heavy detection is throttled. 6/minute = look every 10 seconds.
+DETECTIONS_PER_MINUTE = 6
 DETECT_INTERVAL = 60.0 / DETECTIONS_PER_MINUTE
 
 RECONNECT_DELAY = 3      # seconds to wait between (re)connect attempts
@@ -115,21 +112,23 @@ def inside_ids(detections, mask, threshold):
     return found, len(found)
 
 
-def log_report(report, area_id):
-    """Print a car's final numbers and save them to the logbook database now."""
-    station_name = f"Station {area_id}"
-    print(f"\n=============  {station_name}: CAR FINISHED  =============")
-    print(f"  Car ID                      : {report.get('car_track_id')}")
-    print(f"  Cycle time (car in station) : {report['cycle_time']:.1f} s")
-    print(f"  Hands-on time (total)       : {report['hands_on_time']:.1f} s")
-    print(f"  Unique workers              : {report['unique_workers']}")
-    print(f"  Separate on-sessions        : {report['on_sessions']}")
-    for w in report.get("workers", []):
-        print(f"    - worker {w['index']}: {w['hands_on']:.1f} s over {w['sessions']} session(s)")
-    print("===================================================")
+def mmss(seconds):
+    """Format seconds as m:ss (e.g. 125 -> '2:05')."""
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def log_stage_visit(report, stage_id):
+    """Print a car's stage dwell time and save it to the logbook database now."""
+    stage_name = f"Stage {stage_id}"
+    dwell = report["cycle_time"]
+    print(f"\n=====  {stage_name}: CAR LEFT  =====")
+    print(f"  Car ID     : {report.get('car_track_id')}")
+    print(f"  Stayed for : {dwell:.1f} s  ({mmss(dwell)})")
+    print("==================================")
 
     try:
-        db.save_car(report, station_name)
+        db.save_stage_visit(report, stage_name)
         print("  (saved to logbook.db)\n")
     except Exception as err:  # noqa: BLE001 - never let a save error crash the live view
         print(f"  WARNING: could not save to database: {err}\n")
@@ -218,22 +217,19 @@ def main():
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
 
-    # --- Load the saved areas (drawn earlier with define_zones.py) ---
-    zones = zc.load_areas()
+    # --- Load the saved stages (drawn earlier with define_zones.py) ---
+    zones = zc.load_stages()
     if zones is None:
-        print("\nNOTE: No areas are saved yet (zones.json not found).")
-        print("The live view will still run, but no stations/work areas will be shown.")
+        print("\nNOTE: No stages are saved yet (zones.json not found).")
+        print("The live view will still run, but no parking stages will be shown.")
         print("To draw them, run:  .\\venv\\Scripts\\python define_zones.py\n")
     else:
-        print(f"Loaded {len(zones['areas'])} area(s): "
-              f"{', '.join('station ' + str(a['id']) for a in zones['areas'])}")
+        print(f"Loaded {len(zones['stages'])} stage(s): "
+              f"{', '.join('stage ' + str(s['id']) for s in zones['stages'])}")
 
-    # Per-area data is prepared once we know the video size (below).
-    # Each entry: {"id", "station_pts", "work_pts", "monitor"}
-    areas = []
-    display_area_id = None      # which area's timer we show on screen (the first)
-    last_report = None          # last finished car (for the on-screen banner)
-    last_report_time = 0.0
+    # Per-stage data is prepared once we know the video size (below).
+    # Each entry: {"id", "pts", "mask", "monitor", "cars", "car_ids"}
+    stages = []
 
     print(f"\nConnecting to camera: {source}")
     print("A video window will open. Click it and press  Q  to quit.\n")
@@ -275,24 +271,19 @@ def main():
                 continue
             last_good_frame = time.time()
 
-            # --- Prepare all areas once, now that we know the video size ---
-            if zones is not None and not areas:
+            # --- Prepare all stages once, now that we know the video size ---
+            if zones is not None and not stages:
                 frame_h, frame_w = frame.shape[:2]
                 saved_wh = zones["image_size"]
-                for a in zones["areas"]:
-                    st_pts = zc.scale_polygon(a[zc.STATION], saved_wh, (frame_w, frame_h))
-                    wk_pts = zc.scale_polygon(a[zc.WORK_AREA], saved_wh, (frame_w, frame_h))
-                    areas.append({
-                        "id": a["id"],
-                        "station_pts": st_pts,
-                        "work_pts": wk_pts,
-                        "station_mask": make_zone_mask(st_pts, frame_h, frame_w),
-                        "work_mask": make_zone_mask(wk_pts, frame_h, frame_w),
+                for s in zones["stages"]:
+                    pts = zc.scale_polygon(s[zc.STAGE], saved_wh, (frame_w, frame_h))
+                    stages.append({
+                        "id": s["id"],
+                        "pts": pts,
+                        "mask": make_zone_mask(pts, frame_h, frame_w),
                         "monitor": StationMonitor(),
-                        "cars": 0, "car_ids": set(), "worker_ids": set(),
+                        "cars": 0, "car_ids": set(),
                     })
-                if areas:
-                    display_area_id = areas[0]["id"]   # show the first area's timer
 
             now = time.time()
 
@@ -303,7 +294,7 @@ def main():
                 # verbose=False keeps YOLO from printing a line for every frame.
                 results = model(frame, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
-                detections = detections[np.isin(detections.class_id, CLASSES_OF_INTEREST)]
+                detections = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
                 detections = detections[detections.confidence > CONFIDENCE_THRESHOLD]
                 detections = tracker.update_with_detections(detections)
 
@@ -313,20 +304,13 @@ def main():
                     name = model.names[int(class_id)]
                     labels.append(f"{name} #{int(tracker_id)}")
 
-                vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
-                people = detections[np.isin(detections.class_id, PERSON_CLASS)]
-
-                # For each area: check zones (by 60%/40% area overlap) and time it.
-                for a in areas:
-                    a["car_ids"], a["cars"] = inside_ids(vehicles, a["station_mask"], CAR_OVERLAP_THRESHOLD)
-                    a["worker_ids"], _ = inside_ids(people, a["work_mask"], PERSON_OVERLAP_THRESHOLD)
-
-                    report = a["monitor"].update(now, a["car_ids"], a["worker_ids"])
+                # For each stage: is a car parked here (60%+ overlap)? Time it.
+                for a in stages:
+                    a["car_ids"], a["cars"] = inside_ids(detections, a["mask"], CAR_OVERLAP_THRESHOLD)
+                    # No workers this phase, so pass an empty set of worker IDs.
+                    report = a["monitor"].update(now, a["car_ids"], set())
                     if report is not None:
-                        log_report(report, a["id"])
-                        if a["id"] == display_area_id:
-                            last_report = report
-                            last_report_time = now
+                        log_stage_visit(report, a["id"])
 
             # --- Draw the most recent boxes and labels onto the current frame ---
             annotated = frame.copy()
@@ -334,43 +318,16 @@ def main():
                 annotated = box_annotator.annotate(scene=annotated, detections=detections)
                 annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
-            # --- Draw every area (both shapes), coloured and numbered ---
-            for a in areas:
+            # --- Draw every stage, coloured and numbered, with its live dwell ---
+            for a in stages:
                 color = zc.color_for(a["id"])
-                draw_zone(annotated, a["station_pts"], color, f"STATION {a['id']}", a["cars"])
-                draw_zone(annotated, a["work_pts"], color, f"WORK {a['id']}", len(a["worker_ids"]))
-
-            # --- Show the FIRST area's live timer in the top-left panel ---
-            if display_area_id is not None:
-                first = areas[0]
-                readout = first["monitor"].live_readout()
-                cv2.putText(annotated, f"STATION {first['id']}", (15, 75),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, zc.color_for(first["id"]), 2, cv2.LINE_AA)
-                car_status = "YES" if first["cars"] > 0 else "no"
-                worker_status = "YES" if len(first["worker_ids"]) > 0 else "no"
-                cv2.putText(annotated, f"Car in station: {car_status}   Worker: {worker_status}",
-                            (15, 103), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                if readout is not None:
-                    working = "WORKING" if readout["worker_on"] else "paused"
-                    cv2.putText(annotated,
-                                f"CYCLE: {readout['cycle_time']:.0f}s   HANDS-ON: {readout['hands_on_time']:.0f}s  [{working}]",
-                                (15, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(annotated,
-                                f"on-sessions: {readout['on_sessions']}   workers: {readout['workers_seen']}",
-                                (15, 166), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
-
-                # Show the first area's last finished car for 10 seconds.
-                if last_report is not None and now - last_report_time < 10:
-                    y0 = annotated.shape[0] - 110
-                    box = annotated.copy()
-                    cv2.rectangle(box, (10, y0 - 10), (440, y0 + 95), (0, 0, 0), -1)
-                    annotated = cv2.addWeighted(box, 0.55, annotated, 0.45, 0)
-                    cv2.putText(annotated, f"LAST CAR (station {display_area_id}):", (20, y0 + 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(annotated, f"cycle {last_report['cycle_time']:.0f}s   hands-on {last_report['hands_on_time']:.0f}s",
-                                (20, y0 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-                    cv2.putText(annotated, f"workers {last_report['unique_workers']}   sessions {last_report['on_sessions']}",
-                                (20, y0 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                draw_zone(annotated, a["pts"], color, f"STAGE {a['id']}", a["cars"])
+                readout = a["monitor"].live_readout()
+                if readout is not None:   # a car is currently parked here
+                    corner = tuple(a["pts"][0])
+                    cv2.putText(annotated, f"{mmss(readout['cycle_time'])}",
+                                (corner[0], min(corner[1] + 22, annotated.shape[0] - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
             # --- FPS counter (updates about once per second) ---
             frame_count += 1

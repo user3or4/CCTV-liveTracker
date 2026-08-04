@@ -58,27 +58,23 @@ Python, no server or internet needed). Nothing is lost if the program stops.
 The Excel file has a **Cars** sheet (one row per car) and a **Worker times**
 sheet (each worker's own hands-on time, numbered 1, 2, 3… per car).
 
-### What each column means (and the lean question it answers)
+### Current phase: cars only (parking-stage dwell)
 
-**Cars** sheet:
+The **Stage visits** sheet has one row each time a car leaves a parking stage:
 
 | Column | Plain meaning | Used for |
 |--------|---------------|----------|
-| `started_at` / `finished_at` | when the car entered / left the station | throughput, inter-arrival, timing |
-| `station` | which station (e.g. "Station 1") | line balancing by stage |
-| `car_id` | the car's tracking number | tracing one car |
-| `cycle_time_s` | total time the car was in the station | **cycle time** |
-| `hands_on_s` | time a worker was actually working on it | value-added time |
-| `waiting_s` | `cycle − hands_on` = car sat with nobody working | **muda** (waiting waste) |
-| `on_sessions` | how many separate times work started/stopped | interruptions |
-| `num_workers` | how many workers were counted | staffing per stage |
+| `entered_at` / `left_at` | when the car arrived / left the stage | throughput, timing |
+| `stage` | which parking stage (e.g. "Stage 1") | **line balancing** by stage |
+| `car_id` | the car's tracking number | tracing a car through a stage |
+| `dwell_s` | how long the car stayed in the stage (seconds) | **cycle / stage time** |
 
-**Worker times** sheet: `worker_no` (1, 2, 3… per car), that person's `hands_on_s`
-and `sessions`.
+This is deliberately **raw data** — one honest row per car per stage, no
+averaging — so it can feed cycle-time analysis and stage-load / line-balancing
+comparisons (and muda / muri / mura studies) later.
 
-This is deliberately **raw data** — one honest row per car, no averaging — so it
-can feed cycle-time analysis, stage-load / line-balancing comparisons, and
-muda / muri / mura studies later without being locked into any one view.
+*(The worker "hands-on" phase is deferred; if that data already exists it is
+kept in separate **Cars** / **Worker times** sheets.)*
 
 ---
 
