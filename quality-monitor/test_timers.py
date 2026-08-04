@@ -1,25 +1,25 @@
 """
 Simulated tests for the timing engine (no camera needed).
 
-We fake the passage of time and feed in "who is present" second by second,
-then check the reported numbers are right.
+We fake the passage of time and feed in "which cars/workers are present" second
+by second, then check the reported numbers are right.
 """
 
 from timers import StationMonitor
 
 
 def simulate(schedule, total, dt=0.2,
-             worker_on=2.0, worker_off=2.0, car_on=2.0, car_off=3.0):
+             worker_on=2.0, worker_off=2.0, car_on=2.0, car_off=2.0):
     """
-    schedule(t) -> (car_present: bool, present_worker_ids: set)
-    Steps time from 0 to `total` and returns the report emitted when the car left.
+    schedule(t) -> (car_ids: set, worker_ids: set)
+    Steps time from 0 to `total`; returns the report emitted when the car left.
     """
     mon = StationMonitor(worker_on, worker_off, car_on, car_off)
     report = None
     t = 0.0
     while t <= total:
-        car, ids = schedule(t)
-        r = mon.update(t, car, ids)
+        cars, workers = schedule(t)
+        r = mon.update(t, cars, workers)
         if r is not None:
             report = r
         t += dt
@@ -30,65 +30,78 @@ def approx(a, b, tol=0.6):
     return abs(a - b) <= tol
 
 
-# --- Scenario 1: one worker, steps away and comes back, someone walks past ---
+# --- Scenario 1: one worker steps away and back; someone walks past ---
 def scenario1(t):
-    car = 2.0 <= t <= 30.0          # car raw-present 2..30
+    cars = {100} if 2.0 <= t <= 30.0 else set()   # car #100 in station 2..30
     ids = set()
-    if 3.0 <= t <= 10.0:            # worker #1 present 3..10
-        ids.add(1)
-    if 15.0 <= t <= 20.0:          # worker #1 returns 15..20
-        ids.add(1)
-    if 22.0 <= t <= 23.0:          # someone (#2) just walks past for 1s
-        ids.add(2)
-    return car, ids
+    if 3.0 <= t <= 10.0:
+        ids.add(7)                                # worker #7 present 3..10
+    if 15.0 <= t <= 20.0:
+        ids.add(7)                                # worker #7 returns 15..20
+    if 22.0 <= t <= 23.0:
+        ids.add(9)                                # someone walks past for 1s
+    return cars, ids
 
 
-r1 = simulate(scenario1, total=40.0)
-print("Scenario 1 report:", r1)
-assert r1 is not None, "no report produced"
-# cycle: car debounced on ~t=4, off ~t=33  -> ~29s
-assert approx(r1["cycle_time"], 29.0, 1.5), r1["cycle_time"]
-# hands-on: on-delay and off-delay cancel, so ~ true presence:
-#   ~(10-3) + ~(20-15) = 7 + 5 = ~12s
-assert approx(r1["hands_on_time"], 12.0, 1.5), r1["hands_on_time"]
-assert r1["unique_workers"] == 1, r1["unique_workers"]      # walker-past not counted
-assert r1["on_sessions"] == 2, r1["on_sessions"]            # away and back
-print("  -> unique=1, sessions=2, walker-past ignored  OK")
+r1 = simulate(scenario1, total=40.0, worker_off=2.0, car_off=2.0)
+print("Scenario 1:", r1)
+assert r1["car_track_id"] == 100, r1["car_track_id"]
+assert r1["unique_workers"] == 1, r1["unique_workers"]          # walker-past ignored
+assert r1["on_sessions"] == 2, r1["on_sessions"]               # away and back (2s off)
+assert len(r1["workers"]) == 1 and r1["workers"][0]["index"] == 1, r1["workers"]
+assert r1["workers"][0]["sessions"] == 2, r1["workers"]
+print("  car id captured, 1 worker (numbered 1), 2 sessions, walker ignored  OK")
 
 
-# --- Scenario 2: two workers overlapping (no double counting) ---
+# --- Scenario 2: two workers overlapping -> numbered 1 and 2, union time ---
 def scenario2(t):
-    car = 2.0 <= t <= 25.0
+    cars = {200} if 2.0 <= t <= 25.0 else set()
     ids = set()
     if 4.0 <= t <= 20.0:
         ids.add(1)
-    if 4.0 <= t <= 20.0:
+    if 6.0 <= t <= 20.0:
         ids.add(2)
-    return car, ids
+    return cars, ids
 
 
-r2 = simulate(scenario2, total=35.0)
-print("Scenario 2 report:", r2)
-# both present raw 4..20; counted ~6..22 = ~16s of hands-on (union, NOT ~32)
-assert approx(r2["hands_on_time"], 16.0, 1.5), r2["hands_on_time"]
+r2 = simulate(scenario2, total=35.0, worker_off=2.0, car_off=2.0)
+print("Scenario 2:", r2)
 assert r2["unique_workers"] == 2, r2["unique_workers"]
-assert r2["on_sessions"] == 1, r2["on_sessions"]            # one continuous stretch
-print("  -> two workers, union hands-on ~14s (not doubled)  OK")
+idxs = sorted(w["index"] for w in r2["workers"])
+assert idxs == [1, 2], idxs                                    # numbered from 1
+assert approx(r2["hands_on_time"], 16.0, 1.5), r2["hands_on_time"]  # union, not doubled
+print("  two workers numbered 1 & 2, union hands-on ~16s  OK")
 
 
-# --- Scenario 3: flicker should NOT create on/off churn ---
+# --- Scenario 3: 20s-off tolerance -> a 10s gap does NOT split the session ---
 def scenario3(t):
-    car = 2.0 <= t <= 20.0
+    cars = {300} if 2.0 <= t <= 50.0 else set()
     ids = set()
-    # worker present the whole time EXCEPT a single 0.2s blink at t=10
-    if 4.0 <= t <= 18.0 and not (9.9 <= t <= 10.1):
-        ids.add(1)
-    return car, ids
+    # worker present 4..14, gone 14..24 (10s gap), back 24..40
+    if (4.0 <= t <= 14.0) or (24.0 <= t <= 40.0):
+        ids.add(5)
+    return cars, ids
 
 
-r3 = simulate(scenario3, total=30.0)
-print("Scenario 3 report:", r3)
-assert r3["on_sessions"] == 1, r3["on_sessions"]            # blink ignored -> still one session
-print("  -> single blink ignored, stays one session  OK")
+r3 = simulate(scenario3, total=85.0, worker_on=2.0, worker_off=20.0, car_off=20.0)
+print("Scenario 3:", r3)
+assert r3["on_sessions"] == 1, r3["on_sessions"]              # 10s < 20s -> still one
+assert r3["unique_workers"] == 1, r3["unique_workers"]
+print("  10s gap tolerated by 20s-off rule -> still one session  OK")
+
+
+# --- Scenario 4: a gap longer than 20s DOES split into two sessions ---
+def scenario4(t):
+    cars = {400} if 2.0 <= t <= 90.0 else set()
+    ids = set()
+    if (4.0 <= t <= 20.0) or (50.0 <= t <= 70.0):   # 30s gap
+        ids.add(5)
+    return cars, ids
+
+
+r4 = simulate(scenario4, total=125.0, worker_on=2.0, worker_off=20.0, car_off=20.0)
+print("Scenario 4:", r4)
+assert r4["on_sessions"] == 2, r4["on_sessions"]
+print("  30s gap exceeds 20s-off rule -> two sessions  OK")
 
 print("\nALL TIMING TESTS PASSED")

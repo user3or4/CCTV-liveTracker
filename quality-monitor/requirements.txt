@@ -8,3 +8,5 @@ ultralytics        # the "brain": YOLO object detection
 supervision        # the "organiser": tracking IDs (ByteTrack), counting, zones
 streamlit          # the "dashboard": shows it all in a web page
 numpy              # number handling used throughout (also a dependency above)
+pandas             # reads the logbook for the Excel export
+openpyxl           # lets us write the Excel (.xlsx) file

@@ -11,3 +11,8 @@ __pycache__/
 # Machine-specific runtime data (drawn on your camera / measured on your line)
 zones.json
 cycles.csv
+
+# The logbook database and its exports (your recorded data - keep it local)
+*.db
+logbook_export.xlsx
+*.xlsx

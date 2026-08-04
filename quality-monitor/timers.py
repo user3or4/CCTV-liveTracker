@@ -4,54 +4,49 @@ The timing engine for the worker hands-on timer.
 Two different clocks, in plain words:
 
   - CYCLE TIME  = how long the car sits in the station, start to finish.
-                  It runs the whole time the car is there, whether or not
-                  anyone is working on it. Think "wall clock on the wall".
+                  Runs the whole time the car is there. "Clock on the wall".
 
-  - HANDS-ON TIME = how long a worker is actually present in the work area
-                    next to the car. It counts UP only while a worker is
-                    there and PAUSES when the work area is empty. Think
-                    "stopwatch that only runs while someone is working".
+  - HANDS-ON TIME = how long a worker is actually present in the work area.
+                    Counts UP only while a worker is there and PAUSES when the
+                    area is empty. "Stopwatch that only runs while working".
 
-To stop the numbers flickering when a detection blinks for a frame, we
-"debounce": a worker must be seen for about 2 seconds in a row before we
-count them as ON, and must be gone for about 2 seconds in a row before we
-count them as OFF. The car uses the same idea so a one-frame glitch doesn't
-start or end a cycle by mistake.
+To stop the numbers flickering, we "debounce": a worker must be seen for a
+short time in a row before we count them ON, and must be gone for a while in a
+row before we count them OFF. The OFF wait is deliberately long (20 seconds)
+so a car briefly hidden behind a worker - or a worker who steps out for a
+moment - does not falsely end things.
 
-This file is pure timing logic with no camera or screen code, so it can be
-tested on its own (see test_timers.py).
+Each worker inside one car's visit is numbered 1, 2, 3, ... (in the order they
+first start working), so every station reports per-person times starting from 1.
+
+This file is pure timing logic with no camera or screen code (see test_timers.py).
 """
 
 # Default debounce windows, in seconds.
-WORKER_ON_SECONDS = 2.0
-WORKER_OFF_SECONDS = 2.0
+WORKER_ON_SECONDS = 2.0      # must be present ~2s in a row before counting ON
+WORKER_OFF_SECONDS = 20.0    # must be absent ~20s in a row before counting OFF
 CAR_ON_SECONDS = 2.0
-CAR_OFF_SECONDS = 3.0   # a little longer so a brief blip doesn't end a cycle
+CAR_OFF_SECONDS = 20.0       # a car must be gone ~20s before we end the cycle
 
 
 class Debouncer:
-    """
-    Turns a jittery yes/no signal into a steady one.
-
-    Feed it the raw yes/no each moment; it only flips its steady answer after
-    the raw signal has held the new value long enough (on_secs / off_secs).
-    """
+    """Turns a jittery yes/no signal into a steady one."""
 
     def __init__(self, on_secs, off_secs, start_state=False):
         self.on_secs = on_secs
         self.off_secs = off_secs
         self.state = start_state
-        self._pending_since = None  # when the raw signal first disagreed with state
+        self._pending_since = None
 
     def update(self, raw, now):
         if raw == self.state:
-            self._pending_since = None            # nothing to change
+            self._pending_since = None
         else:
             if self._pending_since is None:
-                self._pending_since = now          # start the waiting clock
+                self._pending_since = now
             needed = self.on_secs if raw else self.off_secs
             if now - self._pending_since >= needed:
-                self.state = raw                   # held long enough: flip
+                self.state = raw
                 self._pending_since = None
         return self.state
 
@@ -62,8 +57,9 @@ class WorkerState:
     def __init__(self, worker_id, on_secs, off_secs):
         self.id = worker_id
         self.deb = Debouncer(on_secs, off_secs)
-        self.on_time = 0.0      # seconds this worker was actively present
-        self.sessions = 0       # how many separate times they were "on"
+        self.on_time = 0.0       # seconds this worker was actively present
+        self.sessions = 0        # how many separate times they were "on"
+        self.local_index = None  # 1, 2, 3, ... assigned when they first count on
 
 
 class CarSession:
@@ -74,28 +70,32 @@ class CarSession:
         self.on_secs = on_secs
         self.off_secs = off_secs
         self.workers = {}          # worker_id -> WorkerState
-        self.hands_on_time = 0.0   # union time: any worker present (no double counting)
-        self.on_sessions = 0       # how many separate "on" stretches (any worker)
-        self.station_on = False    # is at least one worker currently on?
+        self.hands_on_time = 0.0   # union time: any worker present (no double count)
+        self.on_sessions = 0       # separate "on" stretches (any worker)
+        self.station_on = False
+        self.car_track_id = None   # the tracking ID of the car being worked on
+        self._next_index = 1       # next per-station worker number to hand out
 
-    def tick(self, now, dt, present_ids):
-        """Advance all the timers by one step. present_ids = worker IDs in the work area now."""
-        # Make sure every currently-present worker has a record.
-        for wid in present_ids:
+    def tick(self, now, dt, present_worker_ids, present_car_ids):
+        # Remember the car's tracking ID (first one we see in the station).
+        if self.car_track_id is None and present_car_ids:
+            self.car_track_id = min(present_car_ids)
+
+        for wid in present_worker_ids:
             if wid not in self.workers:
                 self.workers[wid] = WorkerState(wid, self.on_secs, self.off_secs)
 
-        # Update each known worker's on/off state and their personal on-time.
         for wid, w in self.workers.items():
             was_on = w.deb.state
-            is_on = w.deb.update(wid in present_ids, now)
+            is_on = w.deb.update(wid in present_worker_ids, now)
             if is_on and not was_on:
                 w.sessions += 1
+                if w.local_index is None:          # first time this worker works
+                    w.local_index = self._next_index
+                    self._next_index += 1
             if is_on:
                 w.on_time += dt
 
-        # Station-level "someone is working" = any worker on. This is the
-        # hands-on clock and it never double counts two workers.
         station_on_now = any(w.deb.state for w in self.workers.values())
         if station_on_now and not self.station_on:
             self.on_sessions += 1
@@ -103,26 +103,34 @@ class CarSession:
             self.hands_on_time += dt
         self.station_on = station_on_now
 
-    def unique_workers(self):
-        """How many different workers were actually counted as on at some point."""
-        return sum(1 for w in self.workers.values() if w.sessions > 0)
+    def counted_workers(self):
+        """Workers who actually worked, sorted by their per-station number."""
+        got = [w for w in self.workers.values() if w.local_index is not None]
+        return sorted(got, key=lambda w: w.local_index)
 
     def finish(self, end_time):
-        """Produce the final report for this car."""
+        workers = self.counted_workers()
         return {
+            "car_track_id": self.car_track_id,
             "cycle_time": round(end_time - self.start, 1),
             "hands_on_time": round(self.hands_on_time, 1),
-            "unique_workers": self.unique_workers(),
+            "unique_workers": len(workers),
             "on_sessions": self.on_sessions,
+            "workers": [
+                {"index": w.local_index,
+                 "hands_on": round(w.on_time, 1),
+                 "sessions": w.sessions}
+                for w in workers
+            ],
         }
 
 
 class StationMonitor:
     """
-    Ties it together for one station: watches for a car arriving/leaving and,
-    while a car is present, runs the hands-on timers for the workers.
+    One station: watches for a car arriving/leaving and, while a car is present,
+    runs the hands-on timers for the workers.
 
-    Call update(...) once per video frame. It returns a finished report dict
+    Call update(...) once per processed frame. Returns a finished report dict
     the moment a car leaves, otherwise None.
     """
 
@@ -135,28 +143,28 @@ class StationMonitor:
         self.session = None
         self.last_time = None
 
-    def update(self, now, car_present_raw, worker_present_ids):
+    def update(self, now, car_ids, worker_present_ids):
         """
         now                : current time in seconds (time.time()).
-        car_present_raw    : True if at least one car is in the station right now.
+        car_ids            : set/list of car tracking IDs in the station now.
         worker_present_ids : set/list of worker tracking IDs in the work area now.
 
         Returns a report dict when a car has just left, else None.
         """
+        car_ids = set(car_ids)
+        worker_present_ids = set(worker_present_ids)
+
         dt = 0.0 if self.last_time is None else now - self.last_time
         self.last_time = now
 
-        car_here = self.car_deb.update(bool(car_present_raw), now)
+        car_here = self.car_deb.update(len(car_ids) > 0, now)
 
-        # A car just arrived -> start a fresh session.
         if car_here and self.session is None:
             self.session = CarSession(now, self.worker_on, self.worker_off)
 
-        # While a car is here, advance the worker timers.
         if self.session is not None:
-            self.session.tick(now, dt, set(worker_present_ids))
+            self.session.tick(now, dt, worker_present_ids, car_ids)
 
-        # A car just left -> finish and report.
         if not car_here and self.session is not None:
             report = self.session.finish(now)
             self.session = None
@@ -164,12 +172,10 @@ class StationMonitor:
 
         return None
 
-    # --- Convenience read-outs for the on-screen display ---
     def is_car_present(self):
         return self.session is not None
 
     def live_readout(self):
-        """Current numbers to show on screen while a car is in the station."""
         if self.session is None:
             return None
         s = self.session
@@ -178,7 +184,7 @@ class StationMonitor:
             "hands_on_time": round(s.hands_on_time, 1),
             "worker_on": s.station_on,
             "on_sessions": s.on_sessions,
-            "workers_seen": s.unique_workers(),
+            "workers_seen": len(s.counted_workers()),
         }
 
 

@@ -23,19 +23,14 @@ import sys
 import time
 import warnings
 
-import csv
-from datetime import datetime
-from pathlib import Path
-
 import cv2
 import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
 import zone_config as zc
+import database as db
 from timers import StationMonitor
-
-CYCLES_CSV = Path(__file__).parent / "cycles.csv"
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -50,7 +45,14 @@ VEHICLE_CLASSES = [2, 3, 5, 7]   # what counts as a "car/vehicle" in the station
 PERSON_CLASS = [0]               # what counts as a "person" in the work area
 
 # Ignore weak guesses below this confidence (0.0-1.0).
-CONFIDENCE_THRESHOLD = 0.35
+# Lowered so real cars are picked up more easily (fewer misses).
+CONFIDENCE_THRESHOLD = 0.25
+
+# To keep the computer's load light, we only RUN the AI this many times per
+# minute. The video window still updates smoothly; only the heavy detection is
+# throttled. 15/minute = look at the scene every 4 seconds.
+DETECTIONS_PER_MINUTE = 15
+DETECT_INTERVAL = 60.0 / DETECTIONS_PER_MINUTE
 
 RECONNECT_DELAY = 3      # seconds to wait between (re)connect attempts
 FEED_TIMEOUT = 5         # seconds of no frames before we treat the feed as dropped
@@ -93,23 +95,23 @@ def ids_inside(detections, polygon):
 
 
 def log_report(report, area_id):
-    """Print a car's final numbers and append them to cycles.csv for the record."""
-    print(f"\n=============  STATION {area_id}: CAR FINISHED  =============")
+    """Print a car's final numbers and save them to the logbook database now."""
+    station_name = f"Station {area_id}"
+    print(f"\n=============  {station_name}: CAR FINISHED  =============")
+    print(f"  Car ID                      : {report.get('car_track_id')}")
     print(f"  Cycle time (car in station) : {report['cycle_time']:.1f} s")
-    print(f"  Hands-on time (worker there): {report['hands_on_time']:.1f} s")
+    print(f"  Hands-on time (total)       : {report['hands_on_time']:.1f} s")
     print(f"  Unique workers              : {report['unique_workers']}")
     print(f"  Separate on-sessions        : {report['on_sessions']}")
-    print("===================================================\n")
+    for w in report.get("workers", []):
+        print(f"    - worker {w['index']}: {w['hands_on']:.1f} s over {w['sessions']} session(s)")
+    print("===================================================")
 
-    new_file = not CYCLES_CSV.exists()
-    with open(CYCLES_CSV, "a", newline="") as f:
-        writer = csv.writer(f)
-        if new_file:
-            writer.writerow(["finished_at", "station", "cycle_time_s", "hands_on_time_s",
-                             "unique_workers", "on_sessions"])
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), area_id,
-                         report["cycle_time"], report["hands_on_time"],
-                         report["unique_workers"], report["on_sessions"]])
+    try:
+        db.save_car(report, station_name)
+        print("  (saved to logbook.db)\n")
+    except Exception as err:  # noqa: BLE001 - never let a save error crash the live view
+        print(f"  WARNING: could not save to database: {err}\n")
 
 
 def draw_zone(image, polygon, color_bgr, label, count):
@@ -181,6 +183,10 @@ def main():
 
     model = load_model()
 
+    # Make sure the logbook database and its tables exist.
+    db.init_db()
+    print(f"Logbook database ready: {db.DB_FILE}")
+
     # The tracker. It hands out and remembers the stable ID numbers.
     # (ByteTrack is marked deprecated in this library version but works fine.)
     with warnings.catch_warnings():
@@ -217,6 +223,12 @@ def main():
     fps_timer = time.time()
     last_good_frame = time.time()
 
+    # Detection is throttled (see DETECT_INTERVAL). Between runs we keep and
+    # re-draw the most recent results so the video still looks live.
+    detections = None
+    labels = []
+    last_detect_time = 0.0
+
     try:
         while True:
             # --- (Re)connect if needed ---
@@ -252,48 +264,51 @@ def main():
                         "station_pts": zc.scale_polygon(a[zc.STATION], saved_wh, (frame_w, frame_h)),
                         "work_pts": zc.scale_polygon(a[zc.WORK_AREA], saved_wh, (frame_w, frame_h)),
                         "monitor": StationMonitor(),
+                        "cars": 0, "car_ids": set(), "worker_ids": set(),
                     })
                 if areas:
                     display_area_id = areas[0]["id"]   # show the first area's timer
 
-            # --- Detect objects in this frame ---
-            # verbose=False keeps YOLO from printing a line for every frame.
-            results = model(frame, verbose=False)[0]
-            detections = sv.Detections.from_ultralytics(results)
-
-            # Keep only the classes we care about and confident-enough guesses.
-            detections = detections[np.isin(detections.class_id, CLASSES_OF_INTEREST)]
-            detections = detections[detections.confidence > CONFIDENCE_THRESHOLD]
-
-            # --- Assign / update the stable tracking IDs ---
-            detections = tracker.update_with_detections(detections)
-
-            # --- Build a label for each box: e.g. "car #7" ---
-            labels = []
-            for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
-                name = model.names[int(class_id)]
-                labels.append(f"{name} #{int(tracker_id)}")
-
-            # --- Split detections once into vehicles and people ---
-            vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
-            people = detections[np.isin(detections.class_id, PERSON_CLASS)]
             now = time.time()
 
-            # --- For each area: check zones and drive its own timer ---
-            for a in areas:
-                a["cars"] = count_inside(vehicles, a["station_pts"])
-                a["worker_ids"] = ids_inside(people, a["work_pts"])
+            # --- Run the AI only every DETECT_INTERVAL seconds (to save load) ---
+            if now - last_detect_time >= DETECT_INTERVAL:
+                last_detect_time = now
 
-                report = a["monitor"].update(now, a["cars"] > 0, a["worker_ids"])
-                if report is not None:
-                    log_report(report, a["id"])
-                    if a["id"] == display_area_id:
-                        last_report = report
-                        last_report_time = now
+                # verbose=False keeps YOLO from printing a line for every frame.
+                results = model(frame, verbose=False)[0]
+                detections = sv.Detections.from_ultralytics(results)
+                detections = detections[np.isin(detections.class_id, CLASSES_OF_INTEREST)]
+                detections = detections[detections.confidence > CONFIDENCE_THRESHOLD]
+                detections = tracker.update_with_detections(detections)
 
-            # --- Draw boxes and labels onto the frame ---
-            annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
-            annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+                # Build a label for each box: e.g. "car #7".
+                labels = []
+                for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
+                    name = model.names[int(class_id)]
+                    labels.append(f"{name} #{int(tracker_id)}")
+
+                vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
+                people = detections[np.isin(detections.class_id, PERSON_CLASS)]
+
+                # For each area: check zones and drive its own timer.
+                for a in areas:
+                    a["car_ids"] = ids_inside(vehicles, a["station_pts"])
+                    a["cars"] = len(a["car_ids"])
+                    a["worker_ids"] = ids_inside(people, a["work_pts"])
+
+                    report = a["monitor"].update(now, a["car_ids"], a["worker_ids"])
+                    if report is not None:
+                        log_report(report, a["id"])
+                        if a["id"] == display_area_id:
+                            last_report = report
+                            last_report_time = now
+
+            # --- Draw the most recent boxes and labels onto the current frame ---
+            annotated = frame.copy()
+            if detections is not None:
+                annotated = box_annotator.annotate(scene=annotated, detections=detections)
+                annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
             # --- Draw every area (both shapes), coloured and numbered ---
             for a in areas:
@@ -341,9 +356,10 @@ def main():
                 frame_count = 0
                 fps_timer = time.time()
 
+            n_objects = len(detections) if detections is not None else 0
             cv2.putText(
                 annotated,
-                f"FPS: {fps:4.1f}   objects: {len(detections)}",
+                f"FPS: {fps:4.1f}   objects: {n_objects}",
                 (15, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
