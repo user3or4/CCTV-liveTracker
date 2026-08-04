@@ -14,7 +14,8 @@ the script tells you clearly instead of failing silently.
 from pathlib import Path
 from ultralytics import YOLO
 
-MODEL_NAME = "yolov8n.pt"
+# Match the model live_detect.py uses (medium = stronger detection).
+MODEL_NAME = "yolov8m.pt"
 
 
 def main() -> None:

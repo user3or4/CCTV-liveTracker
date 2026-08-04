@@ -36,7 +36,20 @@ from timers import StationMonitor
 # Settings
 # ---------------------------------------------------------------------------
 DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=5&subtype=0"
-MODEL_NAME = "yolov8n.pt"
+
+# Which YOLO model to use. Bigger = stronger detection (better for a tilted
+# camera, distant/partly-hidden people and cars) but slower. Because we only
+# run detection 15x/minute, a bigger model is affordable here.
+#   yolov8n.pt = nano   (fastest, weakest)
+#   yolov8s.pt = small
+#   yolov8m.pt = medium (recommended balance)
+#   yolov8l.pt = large  (strongest we'd normally use; slowest)
+MODEL_NAME = "yolov8m.pt"
+
+# "How much of the object must be inside the area to count as IN" (0.0-1.0).
+# 0.6 = 60%. Overlap is measured by area, which suits an angled camera.
+CAR_OVERLAP_THRESHOLD = 0.60      # a car counts when 60%+ of it is in the station
+PERSON_OVERLAP_THRESHOLD = 0.40   # a worker counts when 40%+ is in the work area
 
 # The things we care about on an assembly line, by their YOLO class number:
 #   0 = person, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
@@ -59,39 +72,47 @@ FEED_TIMEOUT = 5         # seconds of no frames before we treat the feed as drop
 WINDOW_NAME = "Quality Monitor - Detection + Tracking  (press Q to quit)"
 
 
-def count_inside(detections, polygon):
+def make_zone_mask(polygon, height, width):
     """
-    Count how many of the given objects are INSIDE the polygon.
+    Paint the zone as a solid shape on a blank image (1 = inside, 0 = outside).
+    We build this once so the overlap test below is fast.
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon.reshape((-1, 1, 2)).astype(np.int32)], 1)
+    return mask
 
-    We test the point where each object touches the ground (the bottom-centre
-    of its box) - so a car counts when its wheels are in the zone and a worker
-    when their feet are. Uses OpenCV's point-in-polygon test, which works the
-    same across all library versions.
+
+def overlap_fraction(box, mask):
+    """
+    How much of an object's box sits inside the zone, from 0.0 (none) to 1.0
+    (all of it). This is the "how much of the car is on the area" measure - it
+    handles a tilted camera far better than a single foot point.
+    """
+    h, w = mask.shape
+    x1 = max(0, int(box[0])); y1 = max(0, int(box[1]))
+    x2 = min(w, int(box[2])); y2 = min(h, int(box[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    region = mask[y1:y2, x1:x2]
+    if region.size == 0:
+        return 0.0
+    return float(region.mean())   # mask is 0/1, so the mean IS the fraction inside
+
+
+def inside_ids(detections, mask, threshold):
+    """
+    Return (set_of_tracking_ids, count) for objects that are at least
+    `threshold` (e.g. 0.6 = 60%) inside the zone.
     """
     if len(detections) == 0:
-        return 0
-    contour = polygon.reshape((-1, 1, 2)).astype(np.int32)
-    count = 0
-    for x1, y1, x2, y2 in detections.xyxy:
-        foot = (float((x1 + x2) / 2.0), float(y2))
-        if cv2.pointPolygonTest(contour, foot, False) >= 0:
-            count += 1
-    return count
-
-
-def ids_inside(detections, polygon):
-    """Return the set of tracking IDs whose ground point is inside the polygon."""
-    if len(detections) == 0:
-        return set()
-    contour = polygon.reshape((-1, 1, 2)).astype(np.int32)
+        return set(), 0
     tracker_ids = detections.tracker_id
     found = set()
-    for i, (x1, y1, x2, y2) in enumerate(detections.xyxy):
-        foot = (float((x1 + x2) / 2.0), float(y2))
-        if cv2.pointPolygonTest(contour, foot, False) >= 0:
+    for i, box in enumerate(detections.xyxy):
+        if overlap_fraction(box, mask) >= threshold:
             tid = tracker_ids[i] if tracker_ids is not None else i
             found.add(int(tid))
-    return found
+    return found, len(found)
 
 
 def log_report(report, area_id):
@@ -259,10 +280,14 @@ def main():
                 frame_h, frame_w = frame.shape[:2]
                 saved_wh = zones["image_size"]
                 for a in zones["areas"]:
+                    st_pts = zc.scale_polygon(a[zc.STATION], saved_wh, (frame_w, frame_h))
+                    wk_pts = zc.scale_polygon(a[zc.WORK_AREA], saved_wh, (frame_w, frame_h))
                     areas.append({
                         "id": a["id"],
-                        "station_pts": zc.scale_polygon(a[zc.STATION], saved_wh, (frame_w, frame_h)),
-                        "work_pts": zc.scale_polygon(a[zc.WORK_AREA], saved_wh, (frame_w, frame_h)),
+                        "station_pts": st_pts,
+                        "work_pts": wk_pts,
+                        "station_mask": make_zone_mask(st_pts, frame_h, frame_w),
+                        "work_mask": make_zone_mask(wk_pts, frame_h, frame_w),
                         "monitor": StationMonitor(),
                         "cars": 0, "car_ids": set(), "worker_ids": set(),
                     })
@@ -291,11 +316,10 @@ def main():
                 vehicles = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
                 people = detections[np.isin(detections.class_id, PERSON_CLASS)]
 
-                # For each area: check zones and drive its own timer.
+                # For each area: check zones (by 60%/40% area overlap) and time it.
                 for a in areas:
-                    a["car_ids"] = ids_inside(vehicles, a["station_pts"])
-                    a["cars"] = len(a["car_ids"])
-                    a["worker_ids"] = ids_inside(people, a["work_pts"])
+                    a["car_ids"], a["cars"] = inside_ids(vehicles, a["station_mask"], CAR_OVERLAP_THRESHOLD)
+                    a["worker_ids"], _ = inside_ids(people, a["work_mask"], PERSON_OVERLAP_THRESHOLD)
 
                     report = a["monitor"].update(now, a["car_ids"], a["worker_ids"])
                     if report is not None:
