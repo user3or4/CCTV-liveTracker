@@ -112,6 +112,8 @@ class CarSession:
         workers = self.counted_workers()
         return {
             "car_track_id": self.car_track_id,
+            "start_epoch": self.start,      # when the car arrived (for started_at)
+            "end_epoch": end_time,          # when the car left (for finished_at)
             "cycle_time": round(end_time - self.start, 1),
             "hands_on_time": round(self.hands_on_time, 1),
             "unique_workers": len(workers),

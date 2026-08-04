@@ -38,11 +38,13 @@ def init_db(db_path=DB_FILE):
         """
         CREATE TABLE IF NOT EXISTS cars (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at     TEXT,               -- date and time the car arrived
             finished_at    TEXT    NOT NULL,   -- date and time the car left
             station        TEXT    NOT NULL,   -- e.g. "Station 1"
             car_id         INTEGER,            -- the car's tracking number
             cycle_time_s   REAL    NOT NULL,   -- seconds car was in the station
             hands_on_s     REAL    NOT NULL,   -- total worker time (no double count)
+            waiting_s      REAL,               -- cycle - hands-on = idle time (muda)
             on_sessions    INTEGER NOT NULL,   -- separate on/off worker sessions
             num_workers    INTEGER NOT NULL    -- how many workers were counted
         );
@@ -57,6 +59,11 @@ def init_db(db_path=DB_FILE):
         );
         """
     )
+    # Add newer columns to an older logbook that predates them (keeps old data).
+    existing = [row[1] for row in conn.execute("PRAGMA table_info(cars)")]
+    for col, decl in (("started_at", "TEXT"), ("waiting_s", "REAL")):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE cars ADD COLUMN {col} {decl}")
     conn.commit()
     conn.close()
 
@@ -70,16 +77,25 @@ def save_car(report, station_name, db_path=DB_FILE, finished_at=None):
             hands_on_time, on_sessions, car_track_id, workers=[...]).
     Returns the new row id in the cars table.
     """
-    when = finished_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fmt = "%Y-%m-%d %H:%M:%S"
+    end_epoch = report.get("end_epoch")
+    start_epoch = report.get("start_epoch")
+    when = finished_at or (
+        datetime.fromtimestamp(end_epoch).strftime(fmt) if end_epoch
+        else datetime.now().strftime(fmt))
+    started = datetime.fromtimestamp(start_epoch).strftime(fmt) if start_epoch else None
+    # Idle time while the car sat with no one working on it (a muda signal).
+    waiting = round(max(report["cycle_time"] - report["hands_on_time"], 0.0), 1)
+
     conn = connect(db_path)
     try:
         cur = conn.execute(
             """INSERT INTO cars
-               (finished_at, station, car_id, cycle_time_s, hands_on_s,
-                on_sessions, num_workers)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (when, station_name, report.get("car_track_id"),
-             report["cycle_time"], report["hands_on_time"],
+               (started_at, finished_at, station, car_id, cycle_time_s, hands_on_s,
+                waiting_s, on_sessions, num_workers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (started, when, station_name, report.get("car_track_id"),
+             report["cycle_time"], report["hands_on_time"], waiting,
              report["on_sessions"], report["unique_workers"]),
         )
         car_row_id = cur.lastrowid

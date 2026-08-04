@@ -58,6 +58,28 @@ Python, no server or internet needed). Nothing is lost if the program stops.
 The Excel file has a **Cars** sheet (one row per car) and a **Worker times**
 sheet (each worker's own hands-on time, numbered 1, 2, 3… per car).
 
+### What each column means (and the lean question it answers)
+
+**Cars** sheet:
+
+| Column | Plain meaning | Used for |
+|--------|---------------|----------|
+| `started_at` / `finished_at` | when the car entered / left the station | throughput, inter-arrival, timing |
+| `station` | which station (e.g. "Station 1") | line balancing by stage |
+| `car_id` | the car's tracking number | tracing one car |
+| `cycle_time_s` | total time the car was in the station | **cycle time** |
+| `hands_on_s` | time a worker was actually working on it | value-added time |
+| `waiting_s` | `cycle − hands_on` = car sat with nobody working | **muda** (waiting waste) |
+| `on_sessions` | how many separate times work started/stopped | interruptions |
+| `num_workers` | how many workers were counted | staffing per stage |
+
+**Worker times** sheet: `worker_no` (1, 2, 3… per car), that person's `hands_on_s`
+and `sessions`.
+
+This is deliberately **raw data** — one honest row per car, no averaging — so it
+can feed cycle-time analysis, stage-load / line-balancing comparisons, and
+muda / muri / mura studies later without being locked into any one view.
+
 ---
 
 ## The AI model (`yolov8n.pt`)
