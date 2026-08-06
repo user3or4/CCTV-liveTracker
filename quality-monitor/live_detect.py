@@ -1,24 +1,35 @@
-"""
-Live CCTV camera viewer WITH detection and tracking.
+r"""
+Live car-stage tracker.
 
-This builds on live_camera.py. On the live video it now:
-  - Detects cars/vehicles and people using the YOLO model.
-  - Draws a labelled box around each one ("car", "person", "truck", ...).
-  - Gives each object a stable tracking ID that stays with it as it moves
-    (using the ByteTrack tracker from the supervision library).
-  - Shows that ID on each box, e.g.  "car #7".
-  - Still shows the current FPS, reconnects if the feed drops, and quits on Q.
+On the live video it detects cars, tracks each with a stable ID, checks which
+parking STAGE each car is in (by area overlap), times how long it stays, and
+saves each finished visit to the logbook. Shows the FPS, reconnects if the feed
+drops, and quits on Q.
 
 How to run it (from inside the quality-monitor folder):
-    ./venv/bin/python live_detect.py
+    .\venv\Scripts\python live_detect.py
 
-To use a different camera, pass its link:
-    ./venv/bin/python live_detect.py "rtsp://user:pass@192.168.1.9:554/stream1"
+You can change the settings right on the command line (all optional):
+    --confidence 0.20     how sure the AI must be (0-1)      [-c]
+    --model yolov8l.pt    which model: yolov8n/s/m/l/x.pt    [-m]
+    --overlap 0.70        how much of a car must be in a stage (0-1)  [-o]
+    --rate 12             detections per minute              [-r]
+    --off 30              seconds gone before "left"
 
-Note: the very first run downloads the YOLO model file (~6 MB) if it isn't
-already here. That needs normal internet access.
+Examples:
+    .\venv\Scripts\python live_detect.py --confidence 0.20
+    .\venv\Scripts\python live_detect.py -c 0.3 -m yolov8l.pt
+    .\venv\Scripts\python live_detect.py --help
+
+To use a different camera, put its link first (in quotes):
+    .\venv\Scripts\python live_detect.py "rtsp://user:pass@10.0.0.9:554/..." -c 0.2
+
+Note: the first run downloads the chosen model file if it isn't already here
+(needs internet). Settings not given on the command line use the defaults near
+the top of this file.
 """
 
+import argparse
 import sys
 import time
 import warnings
@@ -180,11 +191,11 @@ def explain_connection_failure(source):
     print("--------------------------------------------------------------\n")
 
 
-def load_model():
+def load_model(model_name=MODEL_NAME):
     """Load the YOLO model, with a clear message if it can't be found/downloaded."""
     try:
-        print(f"Loading the YOLO model ({MODEL_NAME})...")
-        model = YOLO(MODEL_NAME)
+        print(f"Loading the YOLO model ({model_name})...")
+        model = YOLO(model_name)
         print("Model ready.")
         return model
     except Exception as err:  # noqa: BLE001 - surface the problem in plain words
@@ -198,10 +209,42 @@ def load_model():
         raise SystemExit(1)
 
 
-def main():
-    source = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SOURCE
+def parse_args():
+    """Read optional settings from the command line (all have sensible defaults)."""
+    p = argparse.ArgumentParser(
+        description="Live car-stage tracker. All options are optional.")
+    p.add_argument("source", nargs="?", default=DEFAULT_SOURCE,
+                   help="camera link (defaults to the built-in one)")
+    p.add_argument("--confidence", "-c", type=float, default=CONFIDENCE_THRESHOLD,
+                   help=f"how sure YOLO must be, 0-1 (default {CONFIDENCE_THRESHOLD})")
+    p.add_argument("--model", "-m", default=MODEL_NAME,
+                   help=f"model file: yolov8n/s/m/l/x.pt (default {MODEL_NAME})")
+    p.add_argument("--overlap", "-o", type=float, default=CAR_OVERLAP_THRESHOLD,
+                   help=f"how much of a car must be in a stage, 0-1 (default {CAR_OVERLAP_THRESHOLD})")
+    p.add_argument("--rate", "-r", type=float, default=DETECTIONS_PER_MINUTE,
+                   help=f"detections per minute (default {DETECTIONS_PER_MINUTE})")
+    p.add_argument("--off", type=float, default=None,
+                   help="seconds a car must be gone before 'left' (default 20)")
+    return p.parse_args()
 
-    model = load_model()
+
+def main():
+    args = parse_args()
+    source = args.source
+    confidence = args.confidence
+    overlap = args.overlap
+    detect_interval = 60.0 / args.rate if args.rate > 0 else DETECT_INTERVAL
+    monitor_kwargs = {} if args.off is None else {"car_off": args.off}
+
+    print("Settings for this run:")
+    print(f"  model      = {args.model}")
+    print(f"  confidence = {confidence}")
+    print(f"  overlap    = {overlap}  ({int(overlap * 100)}% of the car must be in a stage)")
+    print(f"  rate       = {args.rate}/min  (look every {detect_interval:.0f}s)")
+    if args.off is not None:
+        print(f"  leave-check = {args.off}s")
+
+    model = load_model(args.model)
 
     # Make sure the logbook database and its tables exist.
     db.init_db()
@@ -281,21 +324,21 @@ def main():
                         "id": s["id"],
                         "pts": pts,
                         "mask": make_zone_mask(pts, frame_h, frame_w),
-                        "monitor": StationMonitor(),
+                        "monitor": StationMonitor(**monitor_kwargs),
                         "cars": 0, "car_ids": set(),
                     })
 
             now = time.time()
 
-            # --- Run the AI only every DETECT_INTERVAL seconds (to save load) ---
-            if now - last_detect_time >= DETECT_INTERVAL:
+            # --- Run the AI only every `detect_interval` seconds (to save load) ---
+            if now - last_detect_time >= detect_interval:
                 last_detect_time = now
 
                 # verbose=False keeps YOLO from printing a line for every frame.
                 results = model(frame, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
                 detections = detections[np.isin(detections.class_id, VEHICLE_CLASSES)]
-                detections = detections[detections.confidence > CONFIDENCE_THRESHOLD]
+                detections = detections[detections.confidence > confidence]
                 detections = tracker.update_with_detections(detections)
 
                 # Build a label for each box: e.g. "car #7".
@@ -306,7 +349,7 @@ def main():
 
                 # For each stage: is a car parked here (60%+ overlap)? Time it.
                 for a in stages:
-                    a["car_ids"], a["cars"] = inside_ids(detections, a["mask"], CAR_OVERLAP_THRESHOLD)
+                    a["car_ids"], a["cars"] = inside_ids(detections, a["mask"], overlap)
                     # No workers this phase, so pass an empty set of worker IDs.
                     report = a["monitor"].update(now, a["car_ids"], set())
                     if report is not None:
