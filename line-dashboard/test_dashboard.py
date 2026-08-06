@@ -1,0 +1,74 @@
+"""
+Tests for the dashboard's data functions (no browser needed).
+
+We build a tiny logbook with visits at different hours and lines, then check
+the summaries and the Excel builder come out right.
+"""
+
+import os
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+import dashboard as d
+
+
+def make_db(rows):
+    """rows: list of (left_at, stage, car_id, dwell_s). Returns a temp db path."""
+    path = Path(tempfile.mkdtemp()) / "logbook.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("""CREATE TABLE stage_visits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, entered_at TEXT, left_at TEXT,
+        stage TEXT, car_id INTEGER, dwell_s REAL)""")
+    for left, stage, cid, dwell in rows:
+        conn.execute("INSERT INTO stage_visits(entered_at,left_at,stage,car_id,dwell_s) "
+                     "VALUES(?,?,?,?,?)", (left, left, stage, cid, dwell))
+    conn.commit()
+    conn.close()
+    return path
+
+
+ROWS = [
+    ("2026-08-04 08:30:00", "Stage 1", 1, 60),    # early
+    ("2026-08-04 10:15:00", "Stage 1", 2, 90),    # morning
+    ("2026-08-04 13:30:00", "Stage 1", 3, 200),   # lunch (slow)
+    ("2026-08-04 15:00:00", "Stage 1", 4, 80),    # afternoon (fast)
+    ("2026-08-04 10:45:00", "Stage 2", 5, 150),
+]
+
+db = make_db(ROWS)
+raw = d.load_visits(db)
+assert len(raw) == 5, len(raw)
+
+# names mapping applies
+names = {"Stage 1": "Line B", "Stage 2": "Line C"}
+df = d.enrich(raw, names)
+assert set(df["line"]) == {"Line B", "Line C"}, set(df["line"])
+assert "part_of_day" in df.columns and "hour" in df.columns
+
+# by_line
+bl = d.by_line(df).set_index("line")
+assert bl.loc["Line B", "cars"] == 4, bl.loc["Line B", "cars"]
+assert bl.loc["Line B", "fastest_s"] == 60 and bl.loc["Line B", "slowest_s"] == 200
+
+# by_part: lunch is the slowest part of day for Line B
+bp = d.by_part(df)
+lineb = bp[bp["line"] == "Line B"].set_index("part_of_day")["avg_s"]
+assert lineb.get("Lunch (13-14)") == 200, lineb.to_dict()
+assert lineb.get("Afternoon (14-17)") == 80, lineb.to_dict()
+print("by time of day (Line B):", {k: v for k, v in lineb.dropna().items()})
+
+# excel builder produces a real workbook with the expected sheets
+xlsx = d.build_excel(df)
+assert xlsx[:2] == b"PK", "not a valid xlsx"
+tmp = Path(tempfile.mkdtemp()) / "out.xlsx"
+tmp.write_bytes(xlsx)
+sheets = pd.ExcelFile(tmp).sheet_names
+assert sheets == ["Stage visits", "By line", "By time of day", "By hour"], sheets
+print("excel sheets:", sheets)
+
+os.remove(db)
+os.remove(tmp)
+print("\nALL DASHBOARD DATA TESTS PASSED")

@@ -1,0 +1,6 @@
+# Libraries for the performance dashboard.
+# Recreate with:  python -m venv venv  then  .\venv\Scripts\pip install -r requirements.txt
+
+streamlit    # the dashboard web page
+pandas       # reading and summarising the logbook
+openpyxl     # writing the Excel download
