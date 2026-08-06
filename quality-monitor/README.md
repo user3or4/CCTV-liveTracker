@@ -69,9 +69,17 @@ The **Stage visits** sheet has one row each time a car leaves a parking stage:
 | `car_id` | the car's tracking number | tracing a car through a stage |
 | `dwell_s` | how long the car stayed in the stage (seconds) | **cycle / stage time** |
 
+The export also adds ready-made summary sheets so you can see performance
+without building a pivot table:
+
+- **By stage** — cars counted, average / fastest / slowest dwell per stage.
+- **By time of day** — the same, split into Morning / Late morning / Lunch /
+  Afternoon… so you can see *when* cycle time is faster or slower.
+- **By hour** — the same, hour by hour (08:00, 09:00, …).
+
 This is deliberately **raw data** — one honest row per car per stage, no
-averaging — so it can feed cycle-time analysis and stage-load / line-balancing
-comparisons (and muda / muri / mura studies) later.
+averaging — plus those summaries, so it can feed cycle-time analysis and
+stage-load / line-balancing comparisons (and muda / muri / mura studies) later.
 
 *(The worker "hands-on" phase is deferred; if that data already exists it is
 kept in separate **Cars** / **Worker times** sheets.)*
