@@ -9,11 +9,34 @@ own toolbox (virtual environment).
 
 ## What it shows
 
-- **Average cycle time by line** — compare lines, spot the slow one.
+- **Average (or median) cycle time by line** — compare lines, spot the slow one.
 - **When is cycle time faster?** — by part of the day (Morning / Lunch /
   Afternoon…) and by hour.
 - **Each car over time** — watch for drift across a shift.
 - **Excel download** — the filtered data plus summary sheets, for deeper analysis.
+
+## Adjustable
+
+The sidebar lets you tailor the view:
+- **Statistic** — switch between Average and Median.
+- **Sections to show** — tick only the charts you want.
+- **Lines** and **Date range** — narrow the data.
+- **Ignore cycles under (seconds)** — data cleaning: hides unreal short cycles
+  (default 60s = anything under a minute is not shown in the charts).
+
+## Admin (edit / erase / clean) — PIN protected
+
+The **🔒 Admin** tab lets you fix the data:
+- **Clean** — permanently delete visits under a chosen length (e.g. under 60s,
+  which aren't real cycles).
+- **Edit or erase rows** — change a value in a cell, or remove a row, then Save.
+
+To protect this tab, set a PIN before launching (PowerShell):
+```
+$env:DASHBOARD_PIN = "1234"
+.\venv\Scripts\streamlit run dashboard.py
+```
+If no PIN is set, the tab still works but shows a warning that it's unprotected.
 
 ## Setup (once)
 

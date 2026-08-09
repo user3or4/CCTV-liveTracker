@@ -69,6 +69,36 @@ sheets = pd.ExcelFile(tmp).sheet_names
 assert sheets == ["Stage visits", "By line", "By time of day", "By hour"], sheets
 print("excel sheets:", sheets)
 
-os.remove(db)
 os.remove(tmp)
+
+# --- data cleaning / editing on a fresh db ---
+db2 = make_db([
+    ("2026-08-04 09:00:00", "Stage 1", 1, 30),    # unreal (<60s)
+    ("2026-08-04 09:10:00", "Stage 1", 2, 45),    # unreal (<60s)
+    ("2026-08-04 09:20:00", "Stage 1", 3, 120),   # real
+    ("2026-08-04 09:30:00", "Stage 2", 4, 300),   # real
+])
+
+# delete_short removes only the sub-60s rows
+removed = d.delete_short(db2, 60)
+assert removed == 2, removed
+left = d.load_visits(db2)
+assert len(left) == 2 and left["dwell_s"].min() == 120, left["dwell_s"].tolist()
+print("delete_short removed", removed, "-> remaining", left["dwell_s"].tolist())
+
+# update_visit changes a field
+rid = int(left.iloc[0]["id"])
+d.update_visit(db2, rid, {"dwell_s": 999, "stage": "Stage X"})
+row = d.load_visits(db2).set_index("id").loc[rid]
+assert row["dwell_s"] == 999 and row["stage"] == "Stage X", row.to_dict()
+print("update_visit ok ->", row["dwell_s"], row["stage"])
+
+# delete_visits erases a specific row
+other = int(left.iloc[1]["id"])
+assert d.delete_visits(db2, [other]) == 1
+assert other not in set(d.load_visits(db2)["id"])
+print("delete_visits ok -> rows left:", len(d.load_visits(db2)))
+
+os.remove(db)
+os.remove(db2)
 print("\nALL DASHBOARD DATA TESTS PASSED")
