@@ -64,8 +64,11 @@ def summarise(df):
       by stage, by part of day (per stage), and by exact hour (per stage).
     Each shows how many cars and the average / fastest / slowest dwell.
     """
+    # Keep the camera in every summary so two cameras don't blur together.
+    cam = ["camera"] if "camera" in df.columns else []
+
     def agg(group_cols):
-        g = (df.groupby(group_cols)["dwell_s"]
+        g = (df.groupby(cam + group_cols)["dwell_s"]
                .agg(cars="count", avg_dwell_s="mean",
                     fastest_s="min", slowest_s="max")
                .reset_index())

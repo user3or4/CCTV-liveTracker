@@ -15,16 +15,16 @@ import pandas as pd
 import dashboard as d
 
 
-def make_db(rows):
+def make_db(rows, camera="cam1"):
     """rows: list of (left_at, stage, car_id, dwell_s). Returns a temp db path."""
     path = Path(tempfile.mkdtemp()) / "logbook.db"
     conn = sqlite3.connect(str(path))
     conn.execute("""CREATE TABLE stage_visits(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, entered_at TEXT, left_at TEXT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, camera TEXT, entered_at TEXT, left_at TEXT,
         stage TEXT, car_id INTEGER, dwell_s REAL)""")
     for left, stage, cid, dwell in rows:
-        conn.execute("INSERT INTO stage_visits(entered_at,left_at,stage,car_id,dwell_s) "
-                     "VALUES(?,?,?,?,?)", (left, left, stage, cid, dwell))
+        conn.execute("INSERT INTO stage_visits(camera,entered_at,left_at,stage,car_id,dwell_s) "
+                     "VALUES(?,?,?,?,?,?)", (camera, left, left, stage, cid, dwell))
     conn.commit()
     conn.close()
     return path
@@ -41,6 +41,8 @@ ROWS = [
 db = make_db(ROWS)
 raw = d.load_visits(db)
 assert len(raw) == 5, len(raw)
+assert "camera" in raw.columns and set(raw["camera"]) == {"cam1"}, raw.columns.tolist()
+print("camera column present:", set(raw["camera"]))
 
 # names mapping applies
 names = {"Stage 1": "Line B", "Stage 2": "Line C"}

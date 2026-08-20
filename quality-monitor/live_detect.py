@@ -16,6 +16,7 @@ You can change the settings right on the command line (all optional):
     --rate 12             detections per minute              [-r]
     --off 30              seconds gone before "left"
     --no-window           run in the background with NO video window (Ctrl+C to stop)
+    --camera cam2         name/ID for this camera or car model (saved with every row)
 
 Examples:
     .\venv\Scripts\python live_detect.py --confidence 0.20
@@ -34,6 +35,7 @@ import argparse
 import sys
 import time
 import warnings
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -154,20 +156,32 @@ def mmss(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def log_stage_visit(report, stage_id):
-    """Print a car's stage dwell time and save it to the logbook database now."""
+# Set in main(): a text file that every printed status line is also saved to.
+LOG_PATH = None
+
+
+def log_line(text):
+    """Print a line AND append it to the run log file (if one is set)."""
+    print(text)
+    if LOG_PATH is not None:
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:  # noqa: BLE001 - logging must never crash the tracker
+            pass
+
+
+def log_stage_visit(report, stage_id, camera=None):
+    """Record a car's stage dwell time to the screen, the run log, and the database."""
     stage_name = f"Stage {stage_id}"
     dwell = report["cycle_time"]
-    print(f"\n=====  {stage_name}: CAR LEFT  =====")
-    print(f"  Car ID     : {report.get('car_track_id')}")
-    print(f"  Stayed for : {dwell:.1f} s  ({mmss(dwell)})")
-    print("==================================")
-
+    tag = f"[{camera}] " if camera else ""
+    log_line(f"{time.strftime('%H:%M:%S')}  {tag}{stage_name}: car #{report.get('car_track_id')} "
+             f"left after {dwell:.0f}s ({mmss(dwell)})")
     try:
-        db.save_stage_visit(report, stage_name)
-        print("  (saved to logbook.db)\n")
+        db.save_stage_visit(report, stage_name, camera=camera)
     except Exception as err:  # noqa: BLE001 - never let a save error crash the live view
-        print(f"  WARNING: could not save to database: {err}\n")
+        log_line(f"  WARNING: could not save to database: {err}")
 
 
 def draw_zone(image, polygon, color_bgr, label, count):
@@ -252,6 +266,9 @@ def parse_args():
                    help="seconds a car must be gone before 'left' (default 20)")
     p.add_argument("--no-window", action="store_true",
                    help="run with NO video window (background data collection; stop with Ctrl+C)")
+    p.add_argument("--camera", default="cam1",
+                   help="a name/ID for this camera or car model, saved with every row "
+                        "(so two cameras can share one logbook). Default 'cam1'.")
     return p.parse_args()
 
 
@@ -263,8 +280,14 @@ def main():
     detect_interval = 60.0 / args.rate if args.rate > 0 else DETECT_INTERVAL
     monitor_kwargs = {} if args.off is None else {"car_off": args.off}
     show_window = not args.no_window
+    camera = args.camera
+
+    # Every status line is also written to a dated run log (per camera).
+    global LOG_PATH
+    LOG_PATH = Path(__file__).resolve().parent / f"run_{camera}_{time.strftime('%Y-%m-%d')}.log"
 
     print("Settings for this run:")
+    print(f"  camera     = {camera}")
     print(f"  model      = {args.model}")
     print(f"  confidence = {confidence}")
     print(f"  overlap    = {overlap}  ({int(overlap * 100)}% of the car must be in a stage)")
@@ -272,6 +295,7 @@ def main():
     if args.off is not None:
         print(f"  leave-check = {args.off}s")
     print(f"  window     = {'on' if show_window else 'OFF (background mode)'}")
+    print(f"  run log    = {LOG_PATH.name}")
 
     model = load_model(args.model)
 
@@ -388,7 +412,7 @@ def main():
                     # No workers this phase, so pass an empty set of worker IDs.
                     report = a["monitor"].update(now, a["car_ids"], set())
                     if report is not None:
-                        log_stage_visit(report, a["id"])
+                        log_stage_visit(report, a["id"], camera=camera)
 
             if show_window:
                 # --- Draw the most recent shapes/boxes and labels onto the frame ---
@@ -442,7 +466,8 @@ def main():
                         parts.append(f"Stage {a['id']}: car#{cid} {mmss(r['cycle_time'])}")
                     else:
                         parts.append(f"Stage {a['id']}: empty")
-                print(time.strftime("%H:%M:%S") + "  " + ("  |  ".join(parts) if parts else "no stages defined"))
+                log_line(f"{time.strftime('%H:%M:%S')}  [{camera}]  "
+                         + ("  |  ".join(parts) if parts else "no stages defined"))
 
     except KeyboardInterrupt:
         print("\nStopped with Ctrl+C.")

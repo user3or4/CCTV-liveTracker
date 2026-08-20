@@ -16,3 +16,7 @@ cycles.csv
 *.db
 logbook_export.xlsx
 *.xlsx
+
+# Background run logs
+run_*.log
+*.log

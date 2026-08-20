@@ -61,6 +61,7 @@ def init_db(db_path=DB_FILE):
         -- Car-only phase: one row each time a car leaves a parking stage.
         CREATE TABLE IF NOT EXISTS stage_visits (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera       TEXT,                 -- which camera / car model this run watched
             entered_at   TEXT,                 -- when the car arrived at the stage
             left_at      TEXT    NOT NULL,     -- when the car left the stage
             stage        TEXT    NOT NULL,     -- e.g. "Stage 1"
@@ -70,10 +71,13 @@ def init_db(db_path=DB_FILE):
         """
     )
     # Add newer columns to an older logbook that predates them (keeps old data).
-    existing = [row[1] for row in conn.execute("PRAGMA table_info(cars)")]
+    cars_cols = [row[1] for row in conn.execute("PRAGMA table_info(cars)")]
     for col, decl in (("started_at", "TEXT"), ("waiting_s", "REAL")):
-        if col not in existing:
+        if col not in cars_cols:
             conn.execute(f"ALTER TABLE cars ADD COLUMN {col} {decl}")
+    visit_cols = [row[1] for row in conn.execute("PRAGMA table_info(stage_visits)")]
+    if "camera" not in visit_cols:
+        conn.execute("ALTER TABLE stage_visits ADD COLUMN camera TEXT")
     conn.commit()
     conn.close()
 
@@ -124,13 +128,14 @@ def save_car(report, station_name, db_path=DB_FILE, finished_at=None):
         conn.close()
 
 
-def save_stage_visit(report, stage_name, db_path=DB_FILE, left_at=None):
+def save_stage_visit(report, stage_name, camera=None, db_path=DB_FILE, left_at=None):
     """
     Save one finished stage visit (a car that stayed in a parking stage) and
     commit immediately so nothing is lost if the program stops.
 
     report: the dict from timers.StationMonitor (cycle_time is the dwell time,
             plus car_track_id and start/end epochs).
+    camera: which camera / car model this run was watching (for multi-camera setups).
     Returns the new row id.
     """
     fmt = "%Y-%m-%d %H:%M:%S"
@@ -144,9 +149,9 @@ def save_stage_visit(report, stage_name, db_path=DB_FILE, left_at=None):
     conn = connect(db_path)
     try:
         cur = conn.execute(
-            """INSERT INTO stage_visits (entered_at, left_at, stage, car_id, dwell_s)
-               VALUES (?, ?, ?, ?, ?)""",
-            (entered, left, stage_name, report.get("car_track_id"),
+            """INSERT INTO stage_visits (camera, entered_at, left_at, stage, car_id, dwell_s)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (camera, entered, left, stage_name, report.get("car_track_id"),
              report["cycle_time"]),
         )
         conn.commit()

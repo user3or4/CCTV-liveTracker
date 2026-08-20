@@ -41,7 +41,7 @@ PART_ORDER = [
     "Early (before 09)", "Morning (09-11)", "Late morning (11-13)",
     "Lunch (13-14)", "Afternoon (14-17)", "Evening (17-20)", "Night (20-06)",
 ]
-EDITABLE_COLS = ["entered_at", "left_at", "stage", "car_id", "dwell_s"]
+EDITABLE_COLS = ["camera", "entered_at", "left_at", "stage", "car_id", "dwell_s"]
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def delete_short(db_path, min_seconds):
 def build_excel(df):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        cols = ["stage", "line", "car_id", "entered_at", "left_at",
+        cols = ["camera", "stage", "line", "car_id", "entered_at", "left_at",
                 "date", "hour", "part_of_day", "dwell_s", "cycle_min"]
         df[[c for c in cols if c in df.columns]].to_excel(writer, sheet_name="Stage visits", index=False)
         by_line(df).to_excel(writer, sheet_name="By line", index=False)
@@ -217,14 +217,25 @@ def render():
     min_cycle = st.sidebar.number_input(
         "Ignore cycles under (seconds)", min_value=0, value=DEFAULT_MIN_CYCLE_S, step=10,
         help="Short blips aren't real cycles. Default 60s hides anything under a minute.")
+
+    # Camera filter (only shown when the logbook has more than one camera).
+    cams = sorted(str(c) for c in df["camera"].dropna().unique()) if "camera" in df.columns else []
+    chosen_cams = cams
+    if len(cams) > 1:
+        chosen_cams = st.sidebar.multiselect("Cameras / car models", cams, default=cams)
+
     lines = sorted(df["line"].unique())
     chosen = st.sidebar.multiselect("Lines", lines, default=lines)
+
     valid_dates = df["left_dt"].dropna()
     date_range = None
     if not valid_dates.empty:
         dmin, dmax = valid_dates.min().date(), valid_dates.max().date()
         date_range = st.sidebar.date_input("Date range", value=(dmin, dmax),
                                            min_value=dmin, max_value=dmax)
+    # NEW: time-of-day filter (hours), not just the date.
+    from_hr, to_hr = st.sidebar.slider("Time of day (hours)", 0, 23, (0, 23),
+                                       help="Keep only cars that left between these hours.")
 
     # --- Sidebar: adjustable display ---
     st.sidebar.header("Display")
@@ -235,9 +246,12 @@ def render():
 
     # Apply filters -> the "view" every tab shares.
     view = df[df["line"].isin(chosen) & (df["dwell_s"] >= min_cycle)]
+    if cams:
+        view = view[view["camera"].astype("string").isin(chosen_cams)]
     if date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         lo, hi = date_range
         view = view[(view["left_dt"].dt.date >= lo) & (view["left_dt"].dt.date <= hi)]
+    view = view[(view["hour"] >= from_hr) & (view["hour"] <= to_hr)]
 
     hidden = len(df) - len(df[df["dwell_s"] >= min_cycle])
     if min_cycle > 0 and hidden > 0:
@@ -299,7 +313,7 @@ def render():
     # ===== DATA & EXPORT =====
     with tab_data:
         st.subheader("Every visit (after filters)")
-        show = ["line", "stage", "car_id", "entered_at", "left_at",
+        show = ["camera", "line", "stage", "car_id", "entered_at", "left_at",
                 "part_of_day", "hour", "dwell_s", "cycle_min"]
         st.dataframe(view[[c for c in show if c in view.columns]],
                      use_container_width=True, hide_index=True)
@@ -336,7 +350,8 @@ def render():
             st.subheader("Edit or erase individual rows")
             st.caption("Change a value in a cell, or tick a row and use the toolbar's 🗑 to remove it. "
                        "Then press Save. The `id` column can't be changed.")
-            editor_df = raw[["id"] + EDITABLE_COLS].copy()
+            edit_cols = [c for c in EDITABLE_COLS if c in raw.columns]
+            editor_df = raw[["id"] + edit_cols].copy()
             edited = st.data_editor(editor_df, num_rows="dynamic", disabled=["id"],
                                     use_container_width=True, hide_index=True, key="editor")
             if st.button("💾 Save changes to the logbook"):
@@ -349,7 +364,7 @@ def render():
                     rid = int(row["id"])
                     if rid in orig.index:
                         o = orig.loc[rid]
-                        changed = {c: row[c] for c in EDITABLE_COLS if str(row[c]) != str(o[c])}
+                        changed = {c: row[c] for c in edit_cols if str(row[c]) != str(o[c])}
                         if changed:
                             update_visit(db_path, rid, changed)
                             n_updated += 1
