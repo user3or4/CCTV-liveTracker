@@ -1,4 +1,4 @@
-"""
+r"""
 Live CCTV camera viewer.
 
 What this does, in plain words:
@@ -9,11 +9,12 @@ What this does, in plain words:
   - If the feed drops for a moment, it keeps trying to reconnect on its own.
   - Press the  Q  key (with the video window in focus) to close it cleanly.
 
-How to run it (from inside the quality-monitor folder):
-    ./venv/bin/python live_camera.py
+How to run it (from inside the project folder):
+    Windows:      .\venv\Scripts\python live_camera.py
+    Mac / Linux:  ./venv/bin/python live_camera.py
 
-To use a different camera, pass its link:
-    ./venv/bin/python live_camera.py "rtsp://user:pass@192.168.1.9:554/stream1"
+To use a different camera, pass its link (in quotes):
+    .\venv\Scripts\python live_camera.py "rtsp://user:pass@10.0.0.9:554/..."
 """
 
 import sys

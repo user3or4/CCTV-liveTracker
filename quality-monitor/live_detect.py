@@ -227,7 +227,7 @@ def load_model(model_name=MODEL_NAME):
         print("Could not load the detection model.")
         print(f"Reason: {err}")
         print("\nThe model file is downloaded automatically the first time, which")
-        print("needs internet access. Run  ./venv/bin/python get_model.py  once")
+        print("needs internet access. Run  .\\venv\\Scripts\\python get_model.py  once")
         print("on a machine with normal internet, then try again.")
         print("--------------------------------------------------------------\n")
         raise SystemExit(1)
