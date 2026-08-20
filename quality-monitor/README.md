@@ -53,6 +53,8 @@ into a small local database file called `logbook.db` (using SQLite — built int
 Python, no server or internet needed). Nothing is lost if the program stops.
 
 - Run the live view:            `.\venv\Scripts\python live_detect.py`
+- Run in the background (no window, just collect data):
+  `.\venv\Scripts\python live_detect.py --no-window`  (stop with Ctrl+C)
 - Turn it into Excel any time:  `.\venv\Scripts\python export_excel.py`
 
 The Excel file has a **Cars** sheet (one row per car) and a **Worker times**

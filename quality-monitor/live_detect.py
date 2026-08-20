@@ -15,6 +15,7 @@ You can change the settings right on the command line (all optional):
     --overlap 0.70        how much of a car must be in a stage (0-1)  [-o]
     --rate 12             detections per minute              [-r]
     --off 30              seconds gone before "left"
+    --no-window           run in the background with NO video window (Ctrl+C to stop)
 
 Examples:
     .\venv\Scripts\python live_detect.py --confidence 0.20
@@ -249,6 +250,8 @@ def parse_args():
                    help=f"detections per minute (default {DETECTIONS_PER_MINUTE})")
     p.add_argument("--off", type=float, default=None,
                    help="seconds a car must be gone before 'left' (default 20)")
+    p.add_argument("--no-window", action="store_true",
+                   help="run with NO video window (background data collection; stop with Ctrl+C)")
     return p.parse_args()
 
 
@@ -259,6 +262,7 @@ def main():
     overlap = args.overlap
     detect_interval = 60.0 / args.rate if args.rate > 0 else DETECT_INTERVAL
     monitor_kwargs = {} if args.off is None else {"car_off": args.off}
+    show_window = not args.no_window
 
     print("Settings for this run:")
     print(f"  model      = {args.model}")
@@ -267,6 +271,7 @@ def main():
     print(f"  rate       = {args.rate}/min  (look every {detect_interval:.0f}s)")
     if args.off is not None:
         print(f"  leave-check = {args.off}s")
+    print(f"  window     = {'on' if show_window else 'OFF (background mode)'}")
 
     model = load_model(args.model)
 
@@ -300,7 +305,11 @@ def main():
     stages = []
 
     print(f"\nConnecting to camera: {source}")
-    print("A video window will open. Click it and press  Q  to quit.\n")
+    if show_window:
+        print("A video window will open. Click it and press  Q  to quit.\n")
+    else:
+        print("Running in background (no window). Data is saved to the logbook.")
+        print("Leave this window open; press Ctrl+C to stop.\n")
 
     capture = None
     fps = 0.0
@@ -356,7 +365,8 @@ def main():
             now = time.time()
 
             # --- Run the AI only every `detect_interval` seconds (to save load) ---
-            if now - last_detect_time >= detect_interval:
+            ran_detection = now - last_detect_time >= detect_interval
+            if ran_detection:
                 last_detect_time = now
 
                 # verbose=False keeps YOLO from printing a line for every frame.
@@ -380,57 +390,59 @@ def main():
                     if report is not None:
                         log_stage_visit(report, a["id"])
 
-            # --- Draw the most recent shapes/boxes and labels onto the frame ---
-            annotated = frame.copy()
-            if detections is not None:
-                # Tint the real car outline when the seg model provides it.
-                if getattr(detections, "mask", None) is not None:
-                    annotated = mask_annotator.annotate(scene=annotated, detections=detections)
-                annotated = box_annotator.annotate(scene=annotated, detections=detections)
-                annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+            if show_window:
+                # --- Draw the most recent shapes/boxes and labels onto the frame ---
+                annotated = frame.copy()
+                if detections is not None:
+                    # Tint the real car outline when the seg model provides it.
+                    if getattr(detections, "mask", None) is not None:
+                        annotated = mask_annotator.annotate(scene=annotated, detections=detections)
+                    annotated = box_annotator.annotate(scene=annotated, detections=detections)
+                    annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
-            # --- Draw every stage, coloured and numbered, with its live dwell ---
-            for a in stages:
-                color = zc.color_for(a["id"])
-                draw_zone(annotated, a["pts"], color, f"STAGE {a['id']}", a["cars"])
-                readout = a["monitor"].live_readout()
-                if readout is not None:   # a car is currently parked here
-                    corner = tuple(a["pts"][0])
-                    cv2.putText(annotated, f"{mmss(readout['cycle_time'])}",
-                                (corner[0], min(corner[1] + 22, annotated.shape[0] - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+                # --- Draw every stage, coloured and numbered, with its live dwell ---
+                for a in stages:
+                    color = zc.color_for(a["id"])
+                    draw_zone(annotated, a["pts"], color, f"STAGE {a['id']}", a["cars"])
+                    readout = a["monitor"].live_readout()
+                    if readout is not None:   # a car is currently parked here
+                        corner = tuple(a["pts"][0])
+                        cv2.putText(annotated, f"{mmss(readout['cycle_time'])}",
+                                    (corner[0], min(corner[1] + 22, annotated.shape[0] - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
-            # --- FPS counter (updates about once per second) ---
-            frame_count += 1
-            elapsed = time.time() - fps_timer
-            if elapsed >= 1.0:
-                fps = frame_count / elapsed
-                frame_count = 0
-                fps_timer = time.time()
+                # --- FPS counter (updates about once per second) ---
+                frame_count += 1
+                elapsed = time.time() - fps_timer
+                if elapsed >= 1.0:
+                    fps = frame_count / elapsed
+                    frame_count = 0
+                    fps_timer = time.time()
 
-            n_objects = len(detections) if detections is not None else 0
-            cv2.putText(
-                annotated,
-                f"FPS: {fps:4.1f}   objects: {n_objects}",
-                (15, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+                n_objects = len(detections) if detections is not None else 0
+                cv2.putText(annotated, f"FPS: {fps:4.1f}   objects: {n_objects}",
+                            (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
 
-            # --- Show it ---
-            cv2.imshow(WINDOW_NAME, annotated)
+                cv2.imshow(WINDOW_NAME, annotated)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q")):
+                    print("\nQ pressed - closing.")
+                    break
+                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    print("\nWindow closed - stopping.")
+                    break
 
-            # --- Quit on Q or window close ---
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q")):
-                print("\nQ pressed - closing.")
-                break
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                print("\nWindow closed - stopping.")
-                break
+            elif ran_detection:
+                # Background mode: print one compact status line per look.
+                parts = []
+                for a in stages:
+                    r = a["monitor"].live_readout()
+                    if r is not None:
+                        cid = min(a["car_ids"]) if a["car_ids"] else "?"
+                        parts.append(f"Stage {a['id']}: car#{cid} {mmss(r['cycle_time'])}")
+                    else:
+                        parts.append(f"Stage {a['id']}: empty")
+                print(time.strftime("%H:%M:%S") + "  " + ("  |  ".join(parts) if parts else "no stages defined"))
 
     except KeyboardInterrupt:
         print("\nStopped with Ctrl+C.")
