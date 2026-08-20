@@ -11,7 +11,7 @@ How to run it (from inside the quality-monitor folder):
 
 You can change the settings right on the command line (all optional):
     --confidence 0.20     how sure the AI must be (0-1)      [-c]
-    --model yolov8l.pt    which model: yolov8n/s/m/l/x.pt    [-m]
+    --model yolov8l-seg.pt  which model: yolov8{n,s,m,l,x}-seg.pt  [-m]
     --overlap 0.70        how much of a car must be in a stage (0-1)  [-o]
     --rate 12             detections per minute              [-r]
     --off 30              seconds gone before "left"
@@ -48,14 +48,15 @@ from timers import StationMonitor
 # ---------------------------------------------------------------------------
 DEFAULT_SOURCE = "rtsp://alahmadiab:A123456a@10.236.7.105:554/cam/realmonitor?channel=5&subtype=0"
 
-# Which YOLO model to use. Bigger = stronger detection (better for a tilted
-# camera, distant/partly-hidden people and cars) but slower. Because we only
-# run detection 15x/minute, a bigger model is affordable here.
-#   yolov8n.pt = nano   (fastest, weakest)
-#   yolov8s.pt = small
-#   yolov8m.pt = medium (recommended balance)
-#   yolov8l.pt = large  (strongest we'd normally use; slowest)
-MODEL_NAME = "yolov8m.pt"
+# Which YOLO model to use. The "-seg" (segmentation) models trace the real
+# outline of each car (a pixel-precise shape), not just a rectangle - so cars
+# parked at an angle no longer overlap neighbouring stages by their box corners.
+#   yolov8n-seg.pt = nano   (fastest, weakest)
+#   yolov8s-seg.pt = small
+#   yolov8m-seg.pt = medium (recommended balance)
+#   yolov8l-seg.pt = large  (strongest we'd normally use; slowest)
+# A plain (non-seg) model still works too; it just falls back to box overlap.
+MODEL_NAME = "yolov8m-seg.pt"
 
 # "How much of the car must be inside the stage to count as parked" (0.0-1.0).
 # 0.6 = 60%. Overlap is measured by area, which suits an angled camera.
@@ -107,17 +108,40 @@ def overlap_fraction(box, mask):
     return float(region.mean())   # mask is 0/1, so the mean IS the fraction inside
 
 
+def shape_overlap_fraction(car_mask, zone_bool):
+    """
+    How much of the car's real outline sits inside the zone, 0.0 to 1.0.
+    Uses the pixel-precise segmentation shape, so an angled car no longer
+    'leaks' into a neighbour stage through its box corners.
+    """
+    car = car_mask.astype(bool)
+    area = int(car.sum())
+    if area == 0 or car.shape != zone_bool.shape:
+        return None   # can't use the shape here; caller falls back to the box
+    return float(np.logical_and(car, zone_bool).sum()) / area
+
+
 def inside_ids(detections, mask, threshold):
     """
     Return (set_of_tracking_ids, count) for objects that are at least
     `threshold` (e.g. 0.6 = 60%) inside the zone.
+
+    Prefers the real car SHAPE (segmentation mask) when the model provides it,
+    and falls back to the bounding-box overlap otherwise.
     """
     if len(detections) == 0:
         return set(), 0
     tracker_ids = detections.tracker_id
+    shapes = getattr(detections, "mask", None)
+    zone_bool = mask.astype(bool)
     found = set()
     for i, box in enumerate(detections.xyxy):
-        if overlap_fraction(box, mask) >= threshold:
+        frac = None
+        if shapes is not None and shapes[i] is not None:
+            frac = shape_overlap_fraction(shapes[i], zone_bool)
+        if frac is None:                       # no shape available -> use the box
+            frac = overlap_fraction(box, mask)
+        if frac >= threshold:
             tid = tracker_ids[i] if tracker_ids is not None else i
             found.add(int(tid))
     return found, len(found)
@@ -218,7 +242,7 @@ def parse_args():
     p.add_argument("--confidence", "-c", type=float, default=CONFIDENCE_THRESHOLD,
                    help=f"how sure YOLO must be, 0-1 (default {CONFIDENCE_THRESHOLD})")
     p.add_argument("--model", "-m", default=MODEL_NAME,
-                   help=f"model file: yolov8n/s/m/l/x.pt (default {MODEL_NAME})")
+                   help=f"model file: yolov8{{n,s,m,l,x}}-seg.pt (default {MODEL_NAME})")
     p.add_argument("--overlap", "-o", type=float, default=CAR_OVERLAP_THRESHOLD,
                    help=f"how much of a car must be in a stage, 0-1 (default {CAR_OVERLAP_THRESHOLD})")
     p.add_argument("--rate", "-r", type=float, default=DETECTIONS_PER_MINUTE,
@@ -259,6 +283,7 @@ def main():
     # These draw the boxes and the text labels for us.
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
+    mask_annotator = sv.MaskAnnotator(opacity=0.35)   # tints the real car shape
 
     # --- Load the saved stages (drawn earlier with define_zones.py) ---
     zones = zc.load_stages()
@@ -355,9 +380,12 @@ def main():
                     if report is not None:
                         log_stage_visit(report, a["id"])
 
-            # --- Draw the most recent boxes and labels onto the current frame ---
+            # --- Draw the most recent shapes/boxes and labels onto the frame ---
             annotated = frame.copy()
             if detections is not None:
+                # Tint the real car outline when the seg model provides it.
+                if getattr(detections, "mask", None) is not None:
+                    annotated = mask_annotator.annotate(scene=annotated, detections=detections)
                 annotated = box_annotator.annotate(scene=annotated, detections=detections)
                 annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 

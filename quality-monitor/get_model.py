@@ -15,7 +15,8 @@ from pathlib import Path
 from ultralytics import YOLO
 
 # Match the model live_detect.py uses (medium = stronger detection).
-MODEL_NAME = "yolov8m.pt"
+# Match the model live_detect.py uses (medium segmentation = real car shapes).
+MODEL_NAME = "yolov8m-seg.pt"
 
 
 def main() -> None:
