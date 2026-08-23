@@ -27,12 +27,14 @@ import io
 import json
 import os
 import sqlite3
+from datetime import datetime, time as dtime
 from pathlib import Path
 
 import pandas as pd
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "quality-monitor" / "logbook.db"
 NAMES_FILE = Path(__file__).resolve().parent / "line_names.json"
+BREAKS_FILE = Path(__file__).resolve().parent / "breaks.json"
 
 # Cycles shorter than this are treated as unreal (a car just passing, a blip).
 DEFAULT_MIN_CYCLE_S = 60
@@ -76,6 +78,7 @@ def enrich(df, names=None):
     names = names or {}
     when = pd.to_datetime(df["left_at"], errors="coerce")
     df["left_dt"] = when
+    df["entered_dt"] = pd.to_datetime(df.get("entered_at"), errors="coerce")
     df["date"] = when.dt.date.astype("string")
     df["hour"] = when.dt.hour
     df["part_of_day"] = when.dt.hour.map(part_of_day)
@@ -84,8 +87,52 @@ def enrich(df, names=None):
     return df
 
 
-def _agg(df, group_cols):
-    g = (df.groupby(group_cols)["dwell_s"]
+def break_overlap_seconds(enter, leave, breaks):
+    """
+    Seconds of a car's stay (enter..leave) that fall inside any break window.
+    breaks: list of (start_time, end_time) as datetime.time, applied on the
+    car's own day. Returns 0 if we don't have both timestamps.
+    """
+    if pd.isna(enter) or pd.isna(leave):
+        return 0.0
+    total = 0.0
+    for bstart, bend in breaks:
+        bs = pd.Timestamp(datetime.combine(enter.date(), bstart))
+        be = pd.Timestamp(datetime.combine(enter.date(), bend))
+        if be <= bs:
+            continue
+        ov = (min(leave, be) - max(enter, bs)).total_seconds()
+        if ov > 0:
+            total += ov
+    return total
+
+
+def apply_breaks(df, breaks):
+    """
+    Add break_s (break time inside each stay) and adjusted_s (dwell minus break)
+    so cycle time can exclude scheduled breaks.
+    """
+    df = df.copy()
+    df["break_s"] = [round(break_overlap_seconds(e, l, breaks), 1)
+                     for e, l in zip(df["entered_dt"], df["left_dt"])]
+    df["adjusted_s"] = (df["dwell_s"] - df["break_s"]).clip(lower=0).round(1)
+    df["adjusted_min"] = (df["adjusted_s"] / 60.0).round(2)
+    return df
+
+
+def load_breaks():
+    """Return {'enabled': bool, 'windows': [(start,end) as HH:MM strings, ...]}."""
+    if BREAKS_FILE.exists():
+        return json.loads(BREAKS_FILE.read_text())
+    return {"enabled": False, "windows": [["12:00", "12:40"], ["15:00", "15:15"]]}
+
+
+def save_breaks(cfg):
+    BREAKS_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def _agg(df, group_cols, value_col="dwell_s"):
+    g = (df.groupby(group_cols)[value_col]
            .agg(cars="count", avg_s="mean", median_s="median",
                 fastest_s="min", slowest_s="max")
            .reset_index())
@@ -94,16 +141,16 @@ def _agg(df, group_cols):
     return g
 
 
-def by_line(df):
-    return _agg(df, ["line"])
+def by_line(df, value_col="dwell_s"):
+    return _agg(df, ["line"], value_col)
 
 
-def by_hour(df):
-    return _agg(df, ["line", "hour"])
+def by_hour(df, value_col="dwell_s"):
+    return _agg(df, ["line", "hour"], value_col)
 
 
-def by_part(df):
-    g = _agg(df, ["line", "part_of_day"])
+def by_part(df, value_col="dwell_s"):
+    g = _agg(df, ["line", "part_of_day"], value_col)
     g["part_of_day"] = pd.Categorical(g["part_of_day"], categories=PART_ORDER, ordered=True)
     return g.sort_values(["line", "part_of_day"])
 
@@ -161,15 +208,18 @@ def delete_short(db_path, min_seconds):
         conn.close()
 
 
-def build_excel(df):
+def build_excel(df, value_col="dwell_s"):
+    """Export raw rows plus summaries. `value_col` is the cycle-time column the
+    summaries are built on (dwell_s, or adjusted_s when breaks are subtracted)."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         cols = ["camera", "stage", "line", "car_id", "entered_at", "left_at",
-                "date", "hour", "part_of_day", "dwell_s", "cycle_min"]
+                "date", "hour", "part_of_day", "dwell_s", "cycle_min",
+                "break_s", "adjusted_s", "adjusted_min"]
         df[[c for c in cols if c in df.columns]].to_excel(writer, sheet_name="Stage visits", index=False)
-        by_line(df).to_excel(writer, sheet_name="By line", index=False)
-        by_part(df).to_excel(writer, sheet_name="By time of day", index=False)
-        by_hour(df).to_excel(writer, sheet_name="By hour", index=False)
+        by_line(df, value_col).to_excel(writer, sheet_name="By line", index=False)
+        by_part(df, value_col).to_excel(writer, sheet_name="By time of day", index=False)
+        by_hour(df, value_col).to_excel(writer, sheet_name="By hour", index=False)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -237,6 +287,29 @@ def render():
     from_hr, to_hr = st.sidebar.slider("Time of day (hours)", 0, 23, (0, 23),
                                        help="Keep only cars that left between these hours.")
 
+    # --- Sidebar: breaks (subtract break time that overlaps a car's stay) ---
+    st.sidebar.header("Breaks")
+    saved_breaks = load_breaks()
+    breaks_on = st.sidebar.checkbox("Subtract break time from cycle time",
+                                    value=saved_breaks.get("enabled", False),
+                                    help="A break inside a car's stay is removed, so you see the real working time.")
+    win = saved_breaks.get("windows", [["12:00", "12:40"], ["15:00", "15:15"]])
+
+    def _t(s):
+        h, m = (int(x) for x in s.split(":"))
+        return dtime(h, m)
+
+    b1s = st.sidebar.time_input("Break 1 start", value=_t(win[0][0]), key="b1s")
+    b1e = st.sidebar.time_input("Break 1 end", value=_t(win[0][1]), key="b1e")
+    b2s = st.sidebar.time_input("Break 2 start", value=_t(win[1][0]), key="b2s")
+    b2e = st.sidebar.time_input("Break 2 end", value=_t(win[1][1]), key="b2e")
+    if st.sidebar.button("💾 Save breaks"):
+        save_breaks({"enabled": breaks_on,
+                     "windows": [[b1s.strftime("%H:%M"), b1e.strftime("%H:%M")],
+                                 [b2s.strftime("%H:%M"), b2e.strftime("%H:%M")]]})
+        st.sidebar.success("Breaks saved.")
+    break_windows = [(b1s, b1e), (b2s, b2e)]
+
     # --- Sidebar: adjustable display ---
     st.sidebar.header("Display")
     stat_label = st.sidebar.radio("Show", ["Average", "Median"], horizontal=True)
@@ -253,9 +326,17 @@ def render():
         view = view[(view["left_dt"].dt.date >= lo) & (view["left_dt"].dt.date <= hi)]
     view = view[(view["hour"] >= from_hr) & (view["hour"] <= to_hr)]
 
+    # Subtract break time when enabled; then every chart uses the adjusted cycle.
+    view = apply_breaks(view, break_windows)
+    value_col = "adjusted_s" if breaks_on else "dwell_s"
+    minutes_col = "adjusted_min" if breaks_on else "cycle_min"
+    cycle_label = "cycle (break-adjusted)" if breaks_on else "cycle"
+
     hidden = len(df) - len(df[df["dwell_s"] >= min_cycle])
     if min_cycle > 0 and hidden > 0:
         st.sidebar.caption(f"{hidden} visit(s) under {min_cycle}s are hidden from the charts.")
+    if breaks_on:
+        st.sidebar.caption("Break time is being subtracted from cycle time.")
 
     tab_perf, tab_setup, tab_data, tab_admin = st.tabs(
         ["📊 Performance", "⚙️ Setup", "📁 Data & export", "🔒 Admin"])
@@ -267,35 +348,37 @@ def render():
         else:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Cars measured", f"{len(view):,}")
-            c2.metric(f"{stat_label} cycle",
-                      mmss(view["dwell_s"].mean() if stat_col == "avg_s" else view["dwell_s"].median()))
-            c3.metric("Fastest", mmss(view["dwell_s"].min()))
-            c4.metric("Slowest", mmss(view["dwell_s"].max()))
+            c2.metric(f"{stat_label} {cycle_label}",
+                      mmss(view[value_col].mean() if stat_col == "avg_s" else view[value_col].median()))
+            c3.metric("Fastest", mmss(view[value_col].min()))
+            c4.metric("Slowest", mmss(view[value_col].max()))
+            if breaks_on:
+                st.caption("Cycle times below have scheduled break time removed.")
 
             if "By line" in sections:
-                st.subheader(f"{stat_label} cycle time by line")
+                st.subheader(f"{stat_label} {cycle_label} time by line")
                 st.caption("Taller bar = slower line. Compare stage load / balance.")
-                st.bar_chart(by_line(view).set_index("line")[stat_col], y_label="seconds")
+                st.bar_chart(by_line(view, value_col).set_index("line")[stat_col], y_label="seconds")
 
             if "By time of day" in sections:
                 st.subheader("When is cycle time faster? (by part of day)")
-                pv = by_part(view).pivot(index="part_of_day", columns="line", values=stat_col)
+                pv = by_part(view, value_col).pivot(index="part_of_day", columns="line", values=stat_col)
                 st.bar_chart(pv.reindex(PART_ORDER).dropna(how="all"), y_label="seconds")
 
             if "By hour" in sections:
                 st.subheader("By hour of day")
-                pvh = by_hour(view).pivot(index="hour", columns="line", values=stat_col)
+                pvh = by_hour(view, value_col).pivot(index="hour", columns="line", values=stat_col)
                 st.bar_chart(pvh, y_label="seconds")
 
             if "Over time" in sections:
                 st.subheader("Each car over time")
                 st.caption("One point per car - watch for drift across the shift.")
-                st.line_chart(view, x="left_dt", y="cycle_min", color="line",
-                              y_label="cycle time (minutes)")
+                st.line_chart(view, x="left_dt", y=minutes_col, color="line",
+                              y_label=f"{cycle_label} time (minutes)")
 
             if "Summary table" in sections:
                 st.subheader("Per-line summary")
-                st.dataframe(by_line(view), use_container_width=True, hide_index=True)
+                st.dataframe(by_line(view, value_col), use_container_width=True, hide_index=True)
 
     # ===== SETUP =====
     with tab_setup:
@@ -314,11 +397,15 @@ def render():
     with tab_data:
         st.subheader("Every visit (after filters)")
         show = ["camera", "line", "stage", "car_id", "entered_at", "left_at",
-                "part_of_day", "hour", "dwell_s", "cycle_min"]
+                "part_of_day", "hour", "dwell_s"]
+        if breaks_on:
+            show += ["break_s", "adjusted_s"]
+        else:
+            show += ["cycle_min"]
         st.dataframe(view[[c for c in show if c in view.columns]],
                      use_container_width=True, hide_index=True)
         st.download_button("⬇️ Download Excel (with summaries)",
-                           data=build_excel(view), file_name="line_performance.xlsx",
+                           data=build_excel(view, value_col), file_name="line_performance.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ===== ADMIN (edit / erase / clean) =====

@@ -103,4 +103,38 @@ print("delete_visits ok -> rows left:", len(d.load_visits(db2)))
 
 os.remove(db)
 os.remove(db2)
+
+# --- break subtraction ---
+from datetime import time as dtime
+
+def one(enter, leave, dwell_s):
+    return pd.DataFrame([{"id": 1, "camera": "c", "entered_at": enter, "left_at": leave,
+                          "stage": "Stage 1", "car_id": 1, "dwell_s": dwell_s}])
+
+# The user's example: 65-min stay, a 40-min break fully inside -> 25 min real.
+b = d.apply_breaks(d.enrich(one("2026-08-04 12:00:00", "2026-08-04 13:05:00", 65 * 60)),
+                   [(dtime(12, 10), dtime(12, 50)), (dtime(0, 0), dtime(0, 0))])
+assert b.iloc[0]["break_s"] == 40 * 60, b.iloc[0]["break_s"]
+assert b.iloc[0]["adjusted_s"] == 25 * 60, b.iloc[0]["adjusted_s"]
+print(f"65min stay - 40min break = {b.iloc[0]['adjusted_s']/60:.0f}min adjusted  OK")
+
+# Partial overlap: stay 12:30-13:30, break 12:00-13:00 -> 30 min overlap.
+b = d.apply_breaks(d.enrich(one("2026-08-04 12:30:00", "2026-08-04 13:30:00", 60 * 60)),
+                   [(dtime(12, 0), dtime(13, 0))])
+assert b.iloc[0]["break_s"] == 30 * 60, b.iloc[0]["break_s"]
+assert b.iloc[0]["adjusted_s"] == 30 * 60, b.iloc[0]["adjusted_s"]
+print("partial overlap 30min  OK")
+
+# No overlap: break outside the stay -> nothing subtracted.
+b = d.apply_breaks(d.enrich(one("2026-08-04 09:00:00", "2026-08-04 09:30:00", 30 * 60)),
+                   [(dtime(12, 0), dtime(12, 40))])
+assert b.iloc[0]["break_s"] == 0 and b.iloc[0]["adjusted_s"] == 30 * 60
+print("no-overlap break=0  OK")
+
+# Two breaks both inside a long stay are both subtracted.
+b = d.apply_breaks(d.enrich(one("2026-08-04 11:00:00", "2026-08-04 16:00:00", 5 * 3600)),
+                   [(dtime(12, 0), dtime(12, 40)), (dtime(15, 0), dtime(15, 15))])
+assert b.iloc[0]["break_s"] == (40 + 15) * 60, b.iloc[0]["break_s"]
+print("two breaks summed  OK")
+
 print("\nALL DASHBOARD DATA TESTS PASSED")
