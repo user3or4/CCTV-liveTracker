@@ -38,8 +38,53 @@ else will be built on top of.
   you open in a browser — with the video, buttons, and live numbers — so you and
   the team can use the system without touching any code.
 
+- **pandas + openpyxl** — The **exporter**. Together they read the logbook and
+  write it out as an Excel spreadsheet whenever you want one.
+
 Put simply: **OpenCV sees the video → YOLO recognises what's in it →
 Supervision counts and tracks it → Streamlit shows it all on a screen.**
+
+---
+
+## The logbook (`logbook.db`)
+
+Every time a car finishes at a station, its numbers are saved **immediately**
+into a small local database file called `logbook.db` (using SQLite — built into
+Python, no server or internet needed). Nothing is lost if the program stops.
+
+- Run the live view:            `.\venv\Scripts\python live_detect.py`
+- Run in the background (no window, just collect data):
+  `.\venv\Scripts\python live_detect.py --no-window`  (stop with Ctrl+C)
+- Turn it into Excel any time:  `.\venv\Scripts\python export_excel.py`
+
+The Excel file has a **Cars** sheet (one row per car) and a **Worker times**
+sheet (each worker's own hands-on time, numbered 1, 2, 3… per car).
+
+### Current phase: cars only (parking-stage dwell)
+
+The **Stage visits** sheet has one row each time a car leaves a parking stage:
+
+| Column | Plain meaning | Used for |
+|--------|---------------|----------|
+| `entered_at` / `left_at` | when the car arrived / left the stage | throughput, timing |
+| `stage` | which parking stage (e.g. "Stage 1") | **line balancing** by stage |
+| `car_id` | the car's tracking number | tracing a car through a stage |
+| `dwell_s` | how long the car stayed in the stage (seconds) | **cycle / stage time** |
+
+The export also adds ready-made summary sheets so you can see performance
+without building a pivot table:
+
+- **By stage** — cars counted, average / fastest / slowest dwell per stage.
+- **By time of day** — the same, split into Morning / Late morning / Lunch /
+  Afternoon… so you can see *when* cycle time is faster or slower.
+- **By hour** — the same, hour by hour (08:00, 09:00, …).
+
+This is deliberately **raw data** — one honest row per car per stage, no
+averaging — plus those summaries, so it can feed cycle-time analysis and
+stage-load / line-balancing comparisons (and muda / muri / mura studies) later.
+
+*(The worker "hands-on" phase is deferred; if that data already exists it is
+kept in separate **Cars** / **Worker times** sheets.)*
 
 ---
 

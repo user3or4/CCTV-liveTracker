@@ -1,20 +1,28 @@
-"""
-Download the standard YOLOv8n model file (yolov8n.pt) used to detect
-cars and people.
+r"""
+Download the YOLO model file used to detect cars.
 
-Run this once, from inside the quality-monitor folder:
+Run this once, from inside the project folder. First install the libraries,
+then run this:
 
-    ./venv/bin/python get_model.py
+    Windows (PowerShell):
+        .\venv\Scripts\pip install -r requirements.txt
+        .\venv\Scripts\python get_model.py
 
-It saves yolov8n.pt (~6 MB) into this folder. On a normal computer or
-server this takes a few seconds. If your network blocks the download,
-the script tells you clearly instead of failing silently.
+    Mac / Linux:
+        ./venv/bin/pip install -r requirements.txt
+        ./venv/bin/python get_model.py
+
+It saves the model file into this folder. On a normal computer this takes a
+few seconds. If your network blocks the download, the script tells you clearly
+instead of failing silently.
 """
 
 from pathlib import Path
 from ultralytics import YOLO
 
-MODEL_NAME = "yolov8n.pt"
+# Match the model live_detect.py uses (medium = stronger detection).
+# Match the model live_detect.py uses (medium segmentation = real car shapes).
+MODEL_NAME = "yolov8m-seg.pt"
 
 
 def main() -> None:

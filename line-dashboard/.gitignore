@@ -1,0 +1,13 @@
+# Python virtual environment (recreate with requirements.txt)
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Your saved line names and any exported spreadsheets (machine-specific)
+line_names.json
+breaks.json
+prefs.json
+car_names.json
+*.xlsx
