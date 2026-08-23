@@ -12,17 +12,36 @@ own toolbox (virtual environment).
 - **Average (or median) cycle time by line** — compare lines, spot the slow one.
 - **When is cycle time faster?** — by part of the day (Morning / Lunch /
   Afternoon…) and by hour.
+- **Each car, one bar per line** — one bar = one car, so at a glance you see
+  which car took the longest and which the shortest (a line with 10 cars shows
+  10 bars).
 - **Each car over time** — watch for drift across a shift.
 - **Excel download** — the filtered data plus summary sheets, for deeper analysis.
 
-## Adjustable
+## Non-production time (real working cycle)
 
-The sidebar lets you tailor the view:
-- **Statistic** — switch between Average and Median.
-- **Sections to show** — tick only the charts you want.
-- **Lines** and **Date range** — narrow the data.
-- **Ignore cycles under (seconds)** — data cleaning: hides unreal short cycles
-  (default 60s = anything under a minute is not shown in the charts).
+Set these once in the sidebar; they're subtracted from each car's cycle time so
+you see the true working time:
+- **OFF time (no production)** — an overnight window (default **16:00 → 07:00
+  next day**), adjustable.
+- **Break time** — up to two break windows.
+
+Example: a car in the station 65 min with a 40-min break inside → shows 25 min.
+
+## Per-day car model
+
+In the **Setup** tab, "Today's car model per line" lets you type which car is
+running on each line today (e.g. *Line B → Land Cruiser*). It **starts blank each
+new day**, so you enter it again, and it's saved alongside that day's data and
+shown in the per-car graph and the export.
+
+## Adjustable & remembered
+
+The sidebar lets you tailor the view — **Statistic** (Average/Median),
+**Sections to show**, **Lines**, **Date range**, **Time of day (hours)**,
+**Cameras**, and **Ignore cycles under (seconds)**. Your choices are **saved
+automatically** and restored on Reload or restart. Tick **Auto every 1 min** to
+have the page refresh itself once a minute.
 
 ## Admin (edit / erase / clean) — PIN protected
 

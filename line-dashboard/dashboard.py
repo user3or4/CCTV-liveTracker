@@ -27,14 +27,16 @@ import io
 import json
 import os
 import sqlite3
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-DEFAULT_DB = Path(__file__).resolve().parent.parent / "quality-monitor" / "logbook.db"
-NAMES_FILE = Path(__file__).resolve().parent / "line_names.json"
-BREAKS_FILE = Path(__file__).resolve().parent / "breaks.json"
+_HERE = Path(__file__).resolve().parent
+DEFAULT_DB = _HERE.parent / "quality-monitor" / "logbook.db"
+NAMES_FILE = _HERE / "line_names.json"
+PREFS_FILE = _HERE / "prefs.json"          # remembered settings (breaks, off-time, display...)
+CAR_NAMES_FILE = _HERE / "car_names.json"  # car model per line PER DAY (blank each new day)
 
 # Cycles shorter than this are treated as unreal (a car just passing, a blip).
 DEFAULT_MIN_CYCLE_S = 60
@@ -87,48 +89,92 @@ def enrich(df, names=None):
     return df
 
 
-def break_overlap_seconds(enter, leave, breaks):
+def window_overlap_seconds(enter, leave, start_t, end_t):
     """
-    Seconds of a car's stay (enter..leave) that fall inside any break window.
-    breaks: list of (start_time, end_time) as datetime.time, applied on the
-    car's own day. Returns 0 if we don't have both timestamps.
+    Seconds of a stay (enter..leave) that fall inside a DAILY window [start,end].
+    If end <= start the window wraps past midnight (e.g. 16:00 -> 07:00 next day).
+    Works for stays that span several days.
     """
-    if pd.isna(enter) or pd.isna(leave):
+    if pd.isna(enter) or pd.isna(leave) or leave <= enter:
+        return 0.0
+    if start_t == end_t:      # an empty/disabled window (not a 24-hour one)
         return 0.0
     total = 0.0
-    for bstart, bend in breaks:
-        bs = pd.Timestamp(datetime.combine(enter.date(), bstart))
-        be = pd.Timestamp(datetime.combine(enter.date(), bend))
-        if be <= bs:
-            continue
-        ov = (min(leave, be) - max(enter, bs)).total_seconds()
+    day = enter.date() - timedelta(days=1)
+    last = leave.date() + timedelta(days=1)
+    while day <= last:
+        ws = pd.Timestamp(datetime.combine(day, start_t))
+        we = pd.Timestamp(datetime.combine(day, end_t))
+        if we <= ws:                      # wraps midnight
+            we = we + pd.Timedelta(days=1)
+        ov = (min(leave, we) - max(enter, ws)).total_seconds()
         if ov > 0:
             total += ov
+        day += timedelta(days=1)
     return total
 
 
-def apply_breaks(df, breaks):
+def total_deduction_seconds(enter, leave, windows):
+    """Sum overlap across every non-production window (breaks + off-time)."""
+    return sum(window_overlap_seconds(enter, leave, s, e) for s, e in windows)
+
+
+def apply_deductions(df, windows):
     """
-    Add break_s (break time inside each stay) and adjusted_s (dwell minus break)
-    so cycle time can exclude scheduled breaks.
+    Add deducted_s (non-production time inside each stay: breaks + off-time) and
+    adjusted_s (dwell minus that), so cycle time reflects real working time.
+    `windows` is a list of (start_time, end_time) datetime.time pairs.
     """
     df = df.copy()
-    df["break_s"] = [round(break_overlap_seconds(e, l, breaks), 1)
-                     for e, l in zip(df["entered_dt"], df["left_dt"])]
-    df["adjusted_s"] = (df["dwell_s"] - df["break_s"]).clip(lower=0).round(1)
+    df["deducted_s"] = [round(total_deduction_seconds(e, l, windows), 1)
+                        for e, l in zip(df["entered_dt"], df["left_dt"])]
+    df["adjusted_s"] = (df["dwell_s"] - df["deducted_s"]).clip(lower=0).round(1)
     df["adjusted_min"] = (df["adjusted_s"] / 60.0).round(2)
     return df
 
 
-def load_breaks():
-    """Return {'enabled': bool, 'windows': [(start,end) as HH:MM strings, ...]}."""
-    if BREAKS_FILE.exists():
-        return json.loads(BREAKS_FILE.read_text())
-    return {"enabled": False, "windows": [["12:00", "12:40"], ["15:00", "15:15"]]}
+DEFAULT_PREFS = {
+    "breaks_enabled": False,
+    "breaks": [["12:00", "12:40"], ["15:00", "15:15"]],
+    "offtime_enabled": True,
+    "offtime": ["16:00", "07:00"],
+    "min_cycle_s": DEFAULT_MIN_CYCLE_S,
+    "stat": "Average",
+    "sections": ["By line", "By time of day", "By hour", "Per car (each line)",
+                 "Over time", "Summary table"],
+    "autorefresh": False,
+}
 
 
-def save_breaks(cfg):
-    BREAKS_FILE.write_text(json.dumps(cfg, indent=2))
+def load_prefs():
+    prefs = dict(DEFAULT_PREFS)
+    if PREFS_FILE.exists():
+        try:
+            prefs.update(json.loads(PREFS_FILE.read_text()))
+        except Exception:  # noqa: BLE001
+            pass
+    return prefs
+
+
+def save_prefs(prefs):
+    try:
+        PREFS_FILE.write_text(json.dumps(prefs, indent=2))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def load_car_names():
+    """{'YYYY-MM-DD': {line: car_model}} - a fresh (empty) sheet each new day."""
+    if CAR_NAMES_FILE.exists():
+        try:
+            return json.loads(CAR_NAMES_FILE.read_text())
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def save_car_names(data):
+    CAR_NAMES_FILE.write_text(json.dumps(data, indent=2))
 
 
 def _agg(df, group_cols, value_col="dwell_s"):
@@ -208,14 +254,22 @@ def delete_short(db_path, min_seconds):
         conn.close()
 
 
+def apply_car_names(df, car_names):
+    """Attach the car model recorded for each row's (date, line)."""
+    df = df.copy()
+    df["car_model"] = [car_names.get(str(dt), {}).get(ln, "")
+                       for dt, ln in zip(df["date"], df["line"])]
+    return df
+
+
 def build_excel(df, value_col="dwell_s"):
     """Export raw rows plus summaries. `value_col` is the cycle-time column the
-    summaries are built on (dwell_s, or adjusted_s when breaks are subtracted)."""
+    summaries are built on (dwell_s, or adjusted_s when time is subtracted)."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        cols = ["camera", "stage", "line", "car_id", "entered_at", "left_at",
+        cols = ["camera", "car_model", "stage", "line", "car_id", "entered_at", "left_at",
                 "date", "hour", "part_of_day", "dwell_s", "cycle_min",
-                "break_s", "adjusted_s", "adjusted_min"]
+                "deducted_s", "adjusted_s", "adjusted_min"]
         df[[c for c in cols if c in df.columns]].to_excel(writer, sheet_name="Stage visits", index=False)
         by_line(df, value_col).to_excel(writer, sheet_name="By line", index=False)
         by_part(df, value_col).to_excel(writer, sheet_name="By time of day", index=False)
@@ -239,11 +293,24 @@ def render():
     st.title("🚗 Production-line performance")
     st.caption("Cycle time per line, read from the tracker's logbook.")
 
+    prefs = load_prefs()
+
+    def _t(s):
+        h, m = (int(x) for x in s.split(":"))
+        return dtime(h, m)
+
     # --- Sidebar: data source ---
     st.sidebar.header("Data source")
     db_path = st.sidebar.text_input("Logbook file (logbook.db)", value=str(DEFAULT_DB))
-    if st.sidebar.button("🔄 Reload"):
+    col_rl, col_ar = st.sidebar.columns([1, 2])
+    if col_rl.button("🔄 Reload"):
         st.rerun()
+    autorefresh = col_ar.checkbox("Auto every 1 min", value=prefs.get("autorefresh", False))
+    if autorefresh:
+        # Reload the whole page every 60s (picks up new data; prefs are restored).
+        import streamlit.components.v1 as components
+        components.html("<script>setTimeout(function(){window.parent.location.reload();},60000);</script>",
+                        height=0)
 
     if not Path(db_path).exists():
         st.warning(f"Can't find the logbook at:\n\n`{db_path}`\n\n"
@@ -260,15 +327,15 @@ def render():
         st.stop()
 
     names = load_names()
-    df = enrich(raw, names)
+    car_names = load_car_names()
+    df = apply_car_names(enrich(raw, names), car_names)
 
     # --- Sidebar: filters (data cleaning + scope) ---
     st.sidebar.header("Filters")
     min_cycle = st.sidebar.number_input(
-        "Ignore cycles under (seconds)", min_value=0, value=DEFAULT_MIN_CYCLE_S, step=10,
-        help="Short blips aren't real cycles. Default 60s hides anything under a minute.")
+        "Ignore cycles under (seconds)", min_value=0, value=int(prefs.get("min_cycle_s", DEFAULT_MIN_CYCLE_S)),
+        step=10, help="Short blips aren't real cycles. Default 60s hides anything under a minute.")
 
-    # Camera filter (only shown when the logbook has more than one camera).
     cams = sorted(str(c) for c in df["camera"].dropna().unique()) if "camera" in df.columns else []
     chosen_cams = cams
     if len(cams) > 1:
@@ -283,39 +350,47 @@ def render():
         dmin, dmax = valid_dates.min().date(), valid_dates.max().date()
         date_range = st.sidebar.date_input("Date range", value=(dmin, dmax),
                                            min_value=dmin, max_value=dmax)
-    # NEW: time-of-day filter (hours), not just the date.
     from_hr, to_hr = st.sidebar.slider("Time of day (hours)", 0, 23, (0, 23),
                                        help="Keep only cars that left between these hours.")
 
-    # --- Sidebar: breaks (subtract break time that overlaps a car's stay) ---
-    st.sidebar.header("Breaks")
-    saved_breaks = load_breaks()
-    breaks_on = st.sidebar.checkbox("Subtract break time from cycle time",
-                                    value=saved_breaks.get("enabled", False),
-                                    help="A break inside a car's stay is removed, so you see the real working time.")
-    win = saved_breaks.get("windows", [["12:00", "12:40"], ["15:00", "15:15"]])
+    # --- Sidebar: non-production time to subtract from cycle time ---
+    st.sidebar.header("Non-production time")
+    offtime_on = st.sidebar.checkbox("Subtract OFF time (no production)",
+                                     value=prefs.get("offtime_enabled", True))
+    off = prefs.get("offtime", ["16:00", "07:00"])
+    o1 = st.sidebar.time_input("Off from", value=_t(off[0]), key="o1")
+    o2 = st.sidebar.time_input("Off until (next day)", value=_t(off[1]), key="o2")
 
-    def _t(s):
-        h, m = (int(x) for x in s.split(":"))
-        return dtime(h, m)
-
-    b1s = st.sidebar.time_input("Break 1 start", value=_t(win[0][0]), key="b1s")
-    b1e = st.sidebar.time_input("Break 1 end", value=_t(win[0][1]), key="b1e")
-    b2s = st.sidebar.time_input("Break 2 start", value=_t(win[1][0]), key="b2s")
-    b2e = st.sidebar.time_input("Break 2 end", value=_t(win[1][1]), key="b2e")
-    if st.sidebar.button("💾 Save breaks"):
-        save_breaks({"enabled": breaks_on,
-                     "windows": [[b1s.strftime("%H:%M"), b1e.strftime("%H:%M")],
-                                 [b2s.strftime("%H:%M"), b2e.strftime("%H:%M")]]})
-        st.sidebar.success("Breaks saved.")
-    break_windows = [(b1s, b1e), (b2s, b2e)]
+    breaks_on = st.sidebar.checkbox("Subtract BREAK time",
+                                    value=prefs.get("breaks_enabled", False))
+    brk = prefs.get("breaks", [["12:00", "12:40"], ["15:00", "15:15"]])
+    b1s = st.sidebar.time_input("Break 1 start", value=_t(brk[0][0]), key="b1s")
+    b1e = st.sidebar.time_input("Break 1 end", value=_t(brk[0][1]), key="b1e")
+    b2s = st.sidebar.time_input("Break 2 start", value=_t(brk[1][0]), key="b2s")
+    b2e = st.sidebar.time_input("Break 2 end", value=_t(brk[1][1]), key="b2e")
 
     # --- Sidebar: adjustable display ---
     st.sidebar.header("Display")
-    stat_label = st.sidebar.radio("Show", ["Average", "Median"], horizontal=True)
+    stat_label = st.sidebar.radio("Show", ["Average", "Median"], horizontal=True,
+                                  index=0 if prefs.get("stat", "Average") == "Average" else 1)
     stat_col = "avg_s" if stat_label == "Average" else "median_s"
-    all_sections = ["By line", "By time of day", "By hour", "Over time", "Summary table"]
-    sections = st.sidebar.multiselect("Sections to show", all_sections, default=all_sections)
+    all_sections = ["By line", "By time of day", "By hour", "Per car (each line)",
+                    "Over time", "Summary table"]
+    sections = st.sidebar.multiselect("Sections to show", all_sections,
+                                      default=prefs.get("sections", all_sections))
+
+    # Remember everything for next time (survives Reload and app restart).
+    save_prefs({
+        "breaks_enabled": breaks_on,
+        "breaks": [[b1s.strftime("%H:%M"), b1e.strftime("%H:%M")],
+                   [b2s.strftime("%H:%M"), b2e.strftime("%H:%M")]],
+        "offtime_enabled": offtime_on,
+        "offtime": [o1.strftime("%H:%M"), o2.strftime("%H:%M")],
+        "min_cycle_s": int(min_cycle),
+        "stat": stat_label,
+        "sections": sections,
+        "autorefresh": autorefresh,
+    })
 
     # Apply filters -> the "view" every tab shares.
     view = df[df["line"].isin(chosen) & (df["dwell_s"] >= min_cycle)]
@@ -326,17 +401,23 @@ def render():
         view = view[(view["left_dt"].dt.date >= lo) & (view["left_dt"].dt.date <= hi)]
     view = view[(view["hour"] >= from_hr) & (view["hour"] <= to_hr)]
 
-    # Subtract break time when enabled; then every chart uses the adjusted cycle.
-    view = apply_breaks(view, break_windows)
-    value_col = "adjusted_s" if breaks_on else "dwell_s"
-    minutes_col = "adjusted_min" if breaks_on else "cycle_min"
-    cycle_label = "cycle (break-adjusted)" if breaks_on else "cycle"
+    # Build the list of non-production windows to subtract, then adjust.
+    windows = []
+    if breaks_on:
+        windows += [(b1s, b1e), (b2s, b2e)]
+    if offtime_on:
+        windows += [(o1, o2)]
+    view = apply_deductions(view, windows)
+    deducting = bool(windows)
+    value_col = "adjusted_s" if deducting else "dwell_s"
+    minutes_col = "adjusted_min" if deducting else "cycle_min"
+    cycle_label = "cycle (adjusted)" if deducting else "cycle"
 
     hidden = len(df) - len(df[df["dwell_s"] >= min_cycle])
     if min_cycle > 0 and hidden > 0:
         st.sidebar.caption(f"{hidden} visit(s) under {min_cycle}s are hidden from the charts.")
-    if breaks_on:
-        st.sidebar.caption("Break time is being subtracted from cycle time.")
+    if deducting:
+        st.sidebar.caption("Break / off-time is being subtracted from cycle time.")
 
     tab_perf, tab_setup, tab_data, tab_admin = st.tabs(
         ["📊 Performance", "⚙️ Setup", "📁 Data & export", "🔒 Admin"])
@@ -352,8 +433,8 @@ def render():
                       mmss(view[value_col].mean() if stat_col == "avg_s" else view[value_col].median()))
             c3.metric("Fastest", mmss(view[value_col].min()))
             c4.metric("Slowest", mmss(view[value_col].max()))
-            if breaks_on:
-                st.caption("Cycle times below have scheduled break time removed.")
+            if deducting:
+                st.caption("Cycle times below have break / off-time removed.")
 
             if "By line" in sections:
                 st.subheader(f"{stat_label} {cycle_label} time by line")
@@ -370,6 +451,23 @@ def render():
                 pvh = by_hour(view, value_col).pivot(index="hour", columns="line", values=stat_col)
                 st.bar_chart(pvh, y_label="seconds")
 
+            if "Per car (each line)" in sections:
+                st.subheader("Each car, one bar per line")
+                st.caption("One bar = one car, in the order it left. Spot the long and short ones at a glance.")
+                for ln in sorted(view["line"].unique()):
+                    d_ln = view[view["line"] == ln].sort_values("left_dt").reset_index(drop=True)
+                    # Title includes today's car model for this line, if set.
+                    model = ""
+                    if "car_model" in d_ln.columns:
+                        mvals = [m for m in d_ln["car_model"].unique() if m]
+                        model = f" — {', '.join(mvals)}" if mvals else ""
+                    st.markdown(f"**{ln}{model}**  ·  {len(d_ln)} cars")
+                    bars = pd.DataFrame({
+                        "car": [f"{i+1}" for i in range(len(d_ln))],
+                        "minutes": d_ln[minutes_col].values,
+                    }).set_index("car")
+                    st.bar_chart(bars, y_label=f"{cycle_label} time (minutes)")
+
             if "Over time" in sections:
                 st.subheader("Each car over time")
                 st.caption("One point per car - watch for drift across the shift.")
@@ -383,23 +481,43 @@ def render():
     # ===== SETUP =====
     with tab_setup:
         st.subheader("Name each stage as a production line")
+        st.caption("This is the permanent line name (kept every day).")
         stages = sorted(raw["stage"].unique())
         new_names = {}
         with st.form("names_form"):
             for s in stages:
                 new_names[s] = st.text_input(f"“{s}” is called:", value=names.get(s, s), key=f"nm_{s}")
-            if st.form_submit_button("💾 Save names"):
+            if st.form_submit_button("💾 Save line names"):
                 save_names(new_names)
                 st.success("Saved. Every tab now uses these names.")
+                st.rerun()
+
+        st.divider()
+        today = datetime.now().strftime("%Y-%m-%d")
+        st.subheader(f"Today's car model per line  ({today})")
+        st.caption("Which car is running on each line today. Starts blank each new day, "
+                   "so you enter it again — it's saved with today's data.")
+        today_map = car_names.get(today, {})
+        line_list = sorted(df["line"].unique())
+        new_today = {}
+        with st.form("car_today_form"):
+            for ln in line_list:
+                new_today[ln] = st.text_input(f"{ln}:", value=today_map.get(ln, ""),
+                                              placeholder="e.g. Land Cruiser", key=f"car_{ln}")
+            if st.form_submit_button("💾 Save today's cars"):
+                data = load_car_names()
+                data[today] = {ln: v.strip() for ln, v in new_today.items() if v.strip()}
+                save_car_names(data)
+                st.success("Saved today's car models.")
                 st.rerun()
 
     # ===== DATA & EXPORT =====
     with tab_data:
         st.subheader("Every visit (after filters)")
-        show = ["camera", "line", "stage", "car_id", "entered_at", "left_at",
+        show = ["camera", "car_model", "line", "stage", "car_id", "entered_at", "left_at",
                 "part_of_day", "hour", "dwell_s"]
-        if breaks_on:
-            show += ["break_s", "adjusted_s"]
+        if deducting:
+            show += ["deducted_s", "adjusted_s"]
         else:
             show += ["cycle_min"]
         st.dataframe(view[[c for c in show if c in view.columns]],

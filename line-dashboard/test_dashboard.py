@@ -112,29 +112,59 @@ def one(enter, leave, dwell_s):
                           "stage": "Stage 1", "car_id": 1, "dwell_s": dwell_s}])
 
 # The user's example: 65-min stay, a 40-min break fully inside -> 25 min real.
-b = d.apply_breaks(d.enrich(one("2026-08-04 12:00:00", "2026-08-04 13:05:00", 65 * 60)),
+b = d.apply_deductions(d.enrich(one("2026-08-04 12:00:00", "2026-08-04 13:05:00", 65 * 60)),
                    [(dtime(12, 10), dtime(12, 50)), (dtime(0, 0), dtime(0, 0))])
-assert b.iloc[0]["break_s"] == 40 * 60, b.iloc[0]["break_s"]
+assert b.iloc[0]["deducted_s"] == 40 * 60, b.iloc[0]["deducted_s"]
 assert b.iloc[0]["adjusted_s"] == 25 * 60, b.iloc[0]["adjusted_s"]
 print(f"65min stay - 40min break = {b.iloc[0]['adjusted_s']/60:.0f}min adjusted  OK")
 
 # Partial overlap: stay 12:30-13:30, break 12:00-13:00 -> 30 min overlap.
-b = d.apply_breaks(d.enrich(one("2026-08-04 12:30:00", "2026-08-04 13:30:00", 60 * 60)),
+b = d.apply_deductions(d.enrich(one("2026-08-04 12:30:00", "2026-08-04 13:30:00", 60 * 60)),
                    [(dtime(12, 0), dtime(13, 0))])
-assert b.iloc[0]["break_s"] == 30 * 60, b.iloc[0]["break_s"]
+assert b.iloc[0]["deducted_s"] == 30 * 60, b.iloc[0]["deducted_s"]
 assert b.iloc[0]["adjusted_s"] == 30 * 60, b.iloc[0]["adjusted_s"]
 print("partial overlap 30min  OK")
 
 # No overlap: break outside the stay -> nothing subtracted.
-b = d.apply_breaks(d.enrich(one("2026-08-04 09:00:00", "2026-08-04 09:30:00", 30 * 60)),
+b = d.apply_deductions(d.enrich(one("2026-08-04 09:00:00", "2026-08-04 09:30:00", 30 * 60)),
                    [(dtime(12, 0), dtime(12, 40))])
-assert b.iloc[0]["break_s"] == 0 and b.iloc[0]["adjusted_s"] == 30 * 60
+assert b.iloc[0]["deducted_s"] == 0 and b.iloc[0]["adjusted_s"] == 30 * 60
 print("no-overlap break=0  OK")
 
 # Two breaks both inside a long stay are both subtracted.
-b = d.apply_breaks(d.enrich(one("2026-08-04 11:00:00", "2026-08-04 16:00:00", 5 * 3600)),
+b = d.apply_deductions(d.enrich(one("2026-08-04 11:00:00", "2026-08-04 16:00:00", 5 * 3600)),
                    [(dtime(12, 0), dtime(12, 40)), (dtime(15, 0), dtime(15, 15))])
-assert b.iloc[0]["break_s"] == (40 + 15) * 60, b.iloc[0]["break_s"]
+assert b.iloc[0]["deducted_s"] == (40 + 15) * 60, b.iloc[0]["deducted_s"]
 print("two breaks summed  OK")
+
+# --- off-time that wraps past midnight (16:00 -> 07:00 next day) ---
+OFF = [(dtime(16, 0), dtime(7, 0))]
+
+# stay fully inside the evening off-time -> all removed
+b = d.apply_deductions(d.enrich(one("2026-08-04 16:30:00", "2026-08-04 17:30:00", 60 * 60)), OFF)
+assert b.iloc[0]["deducted_s"] == 60 * 60 and b.iloc[0]["adjusted_s"] == 0
+print("off-time fully inside -> 0  OK")
+
+# stay 06:30-07:30 crosses the morning end (07:00) -> 30 min off
+b = d.apply_deductions(d.enrich(one("2026-08-05 06:30:00", "2026-08-05 07:30:00", 60 * 60)), OFF)
+assert b.iloc[0]["deducted_s"] == 30 * 60, b.iloc[0]["deducted_s"]
+print("off-time morning edge 30min  OK")
+
+# overnight stay 15:30 -> 08:00 next day: off covers 16:00..07:00 = 15h
+b = d.apply_deductions(
+    d.enrich(one("2026-08-04 15:30:00", "2026-08-05 08:00:00", int(16.5 * 3600))), OFF)
+assert b.iloc[0]["deducted_s"] == 15 * 3600, b.iloc[0]["deducted_s"]
+assert b.iloc[0]["adjusted_s"] == round(16.5 * 3600 - 15 * 3600, 1)
+print("overnight stay: 15h off removed  OK")
+
+# per-day car names attach by date+line, blank when unset
+cn = {"2026-08-04": {"Line B": "Land Cruiser"}}
+dd = d.apply_car_names(d.enrich(one("2026-08-04 12:00:00", "2026-08-04 12:30:00", 1800), ), cn)
+# 'one' has stage 'Stage 1' -> line 'Stage 1' (no name map); so blank here
+assert dd.iloc[0]["car_model"] == "", dd.iloc[0]["car_model"]
+dd2 = d.apply_car_names(d.enrich(one("2026-08-04 12:00:00", "2026-08-04 12:30:00", 1800)),
+                        {"2026-08-04": {"Stage 1": "Hilux"}})
+assert dd2.iloc[0]["car_model"] == "Hilux", dd2.iloc[0]["car_model"]
+print("per-day car name attaches  OK")
 
 print("\nALL DASHBOARD DATA TESTS PASSED")
